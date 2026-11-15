@@ -47,6 +47,8 @@ import type { SimpleRouteJson, SimplifiedPcbTraces } from "../../types"
 import type { HighDensityRoute } from "../../types/high-density-types"
 import { convertHdRouteToSimplifiedRoute } from "../../utils/convertHdRouteToSimplifiedRoute"
 import { mapZToLayerName } from "../../utils/mapZToLayerName"
+import { findPadClearanceViaPosition } from "./findPadClearanceViaPosition"
+import { findTraceClearanceViaPositions } from "./findTraceClearanceViaPositions"
 import {
   createBroadNetMatchers,
   type BroadNetMatchers,
@@ -525,7 +527,9 @@ const getBroadSpatialInteractionDistance = (
     srj.minTraceWidth / 2,
   )
   const traceClearance =
-    (RELAXED_DRC_OPTIONS.traceClearance ?? 0.1) + CLEARANCE_SLACK
+    (srj.minTraceToPadEdgeClearance ??
+      RELAXED_DRC_OPTIONS.traceClearance ??
+      0.1) + CLEARANCE_SLACK
 
   return Math.max(
     maxViaRadius * 2 + PREFERRED_VIA_TO_VIA_CLEARANCE + CLEARANCE_SLACK,
@@ -2701,7 +2705,9 @@ const pushViaSegmentPair = (
   const requiredDistance =
     via.radius +
     segment.radius +
-    (RELAXED_DRC_OPTIONS.traceClearance ?? 0.1) +
+    (srj.minTraceToPadEdgeClearance ??
+      RELAXED_DRC_OPTIONS.traceClearance ??
+      0.1) +
     CLEARANCE_SLACK
   const penetration = requiredDistance - distance
   if (penetration <= 0) return false
@@ -3912,6 +3918,7 @@ export const applySafeTraceLayerMoveForError = (
   spanExpansion: SafeTraceLayerMoveSpanExpansion,
   connMap?: ConnectivityMap,
   directionVariant = 0,
+  adjustViaClearance = false,
 ) => {
   const errorType = getDrcErrorType(error)
   if (
@@ -3978,6 +3985,7 @@ export const applySafeTraceLayerMoveForError = (
       directionVariant % SAFE_TRACE_LAYER_DIRECTION_VARIANT_COUNT
     ]!
 
+  let relocatedVia = false
   const getTerminalEscape = (endpointSide: "start" | "end") => {
     const endpoint = endpointSide === "start" ? first : last
     const pad = getRouteEndpointPad(srj, route, endpoint, connMap)
@@ -4001,7 +4009,17 @@ export const applySafeTraceLayerMoveForError = (
     ) {
       return undefined
     }
-    return escape
+    if (!adjustViaClearance) return escape
+    const clearEscape = findPadClearanceViaPosition(
+      srj,
+      route,
+      escape,
+      viaRadius,
+      [segment.z, targetZ],
+      connMap,
+    )
+    relocatedVia ||= clearEscape !== undefined && clearEscape !== escape
+    return clearEscape
   }
 
   const startEscape = movesStartTerminal
@@ -4010,7 +4028,8 @@ export const applySafeTraceLayerMoveForError = (
   const endEscape = movesEndTerminal ? getTerminalEscape("end") : undefined
   if (
     (movesStartTerminal && !startEscape) ||
-    (movesEndTerminal && !endEscape)
+    (movesEndTerminal && !endEscape) ||
+    (adjustViaClearance && !relocatedVia)
   ) {
     return false
   }
@@ -4097,6 +4116,37 @@ export const applySafeTraceLayerMoveForError = (
 
   for (let index = 1; index < movedRoute.length - 1; index += 1) {
     movedRoute[index]!.pcb_port_id = undefined
+  }
+
+  const boardEdgeClearance = srj.minBoardEdgeClearance ?? 0.2
+  const originalSegments = collectSegmentsForRoute(route, routeIndex)
+  const originalVias = collectViaNodes([route], srj)
+  for (let index = 1; index < movedRoute.length; index += 1) {
+    const start = movedRoute[index - 1]!
+    const end = movedRoute[index]!
+    // Changing layers preserves board-edge clearance along existing XY copper.
+    if (
+      start.z === end.z &&
+      !originalSegments.some(
+        (segment) =>
+          pointIsOnSegment(start, segment.start, segment.end) &&
+          pointIsOnSegment(end, segment.start, segment.end),
+      ) &&
+      getSegmentBoardClearance(srj, start, end) <
+        route.traceThickness / 2 + boardEdgeClearance
+    ) {
+      return false
+    }
+    if (
+      start.z !== end.z &&
+      start.toNextSegmentType !== "through_obstacle" &&
+      !originalVias.some(
+        (via) => areSameXY(via, end) && via.radius >= viaRadius,
+      ) &&
+      getPointBoardClearance(srj, end) < viaRadius + boardEdgeClearance
+    ) {
+      return false
+    }
   }
 
   route.route = movedRoute
@@ -4492,6 +4542,7 @@ const getViaDisplacementTarget = (params: {
   srj: SimpleRouteJson
   via: ViaNode
   segment: Segment
+  segments: Segment[]
   initialTarget: Point
   requiredTraceDistance: number
   requiredObstacleDistance: number
@@ -4501,17 +4552,20 @@ const getViaDisplacementTarget = (params: {
     srj,
     via,
     segment,
+    segments,
     initialTarget,
     requiredTraceDistance,
     requiredObstacleDistance,
     connMap,
   } = params
+  const minZ = Math.min(...via.zLayers)
+  const maxZ = Math.max(...via.zLayers)
   const foreignObstacles = srj.obstacles.filter(
     (obstacle) =>
       !obstacle.isCopperPour &&
       !obstacleSharesNet(via.rootConnectionName, obstacle, connMap) &&
-      getObstacleZLayers(obstacle, srj.layerCount).some((z) =>
-        via.zLayers.includes(z),
+      getObstacleZLayers(obstacle, srj.layerCount).some(
+        (z) => z >= minZ && z <= maxZ,
       ),
   )
   const blockingObstacles = foreignObstacles.filter((obstacle) =>
@@ -4521,6 +4575,12 @@ const getViaDisplacementTarget = (params: {
   )
   const candidateTargets = [
     initialTarget,
+    ...findTraceClearanceViaPositions(
+      via,
+      segments,
+      requiredTraceDistance - via.radius - segment.radius,
+      connMap,
+    ),
     ...blockingObstacles.flatMap((obstacle) =>
       getObstacleEscapePoints({
         point: initialTarget,
@@ -4542,6 +4602,29 @@ const getViaDisplacementTarget = (params: {
           candidateTarget.y - projection.y,
         ) <
         requiredTraceDistance - POSITION_EPSILON
+      ) {
+        return false
+      }
+      if (
+        segments.some(
+          (neighbor) =>
+            neighbor.z >= minZ &&
+            neighbor.z <= maxZ &&
+            !sharesNet(
+              via.rootConnectionName,
+              neighbor.rootConnectionName,
+              connMap,
+            ) &&
+            pointToSegmentDistance(
+              candidateTarget,
+              neighbor.start,
+              neighbor.end,
+            ) <
+              requiredTraceDistance +
+                neighbor.radius -
+                segment.radius -
+                POSITION_EPSILON,
+        )
       ) {
         return false
       }
@@ -4593,12 +4676,26 @@ export const applyViaOnlyDisplacementForTraceError = (
     return false
   }
   const center = { x: centerRecord.x, y: centerRecord.y }
-  const segment = getNearestSegment(
-    collectSegments(routes),
+  const segments = collectSegments(routes)
+  const segment = getNearestSegment(segments, center, expectedTraceRouteIndex)
+  const viaOwnerIds = Array.isArray(error.pcb_trace_ids)
+    ? error.pcb_trace_ids.filter(
+        (id): id is string =>
+          typeof id === "string" && id !== error.pcb_trace_id,
+      )
+    : []
+  const viaOwnerIndexes = viaOwnerIds
+    .map((id) => traceRouteIndexById.get(id))
+    .filter((index): index is number => index !== undefined)
+  const vias = collectViaNodes(routes, srj)
+  const via = getNearestVia(
+    viaOwnerIds.length > 0
+      ? vias.filter((candidate) =>
+          viaOwnerIndexes.includes(candidate.routeIndex),
+        )
+      : vias,
     center,
-    expectedTraceRouteIndex,
   )
-  const via = getNearestVia(collectViaNodes(routes, srj), center)
   if (
     !segment ||
     !via ||
@@ -4635,8 +4732,7 @@ export const applyViaOnlyDisplacementForTraceError = (
         ? (segmentX / segmentLength) * fallbackSign
         : 0
 
-  const requiredTraceDistance =
-    via.radius + segment.radius + requiredClearance + CLEARANCE_SLACK
+  const requiredTraceDistance = via.radius + segment.radius + requiredClearance
   const requiredObstacleDistance =
     via.radius + getViaEdgeToPadEdgeClearance(srj)! + CLEARANCE_SLACK
   const initialTarget = {
@@ -4647,6 +4743,7 @@ export const applyViaOnlyDisplacementForTraceError = (
     srj,
     via,
     segment,
+    segments,
     initialTarget,
     requiredTraceDistance,
     requiredObstacleDistance,
