@@ -47,6 +47,7 @@ type TraceSegment = {
   width: number
   layer: string
   pcbPortIds: string[]
+  primitiveId?: number
 }
 
 type Via = {
@@ -58,13 +59,16 @@ type Via = {
   x: number
   y: number
   diameter: number
+  holeDiameter: number
   layers: string[]
+  primitiveId?: number
 }
 
 type StaticObstacle = {
   kind: "obstacle"
   obstacleType: "pcb_smtpad" | "pcb_plated_hole"
   obstacleId: string
+  shape?: "circle"
   connectedTo: string[]
   x: number
   y: number
@@ -84,10 +88,12 @@ export type AutoroutingDrcError = {
     | "pcb_trace_error"
     | "pcb_via_clearance_error"
     | "pcb_pad_pad_clearance_error"
+    | "pcb_placement_error"
   error_type:
     | "pcb_trace_error"
     | "pcb_via_clearance_error"
     | "pcb_pad_pad_clearance_error"
+    | "pcb_placement_error"
   message: string
   center?: Point
   pcb_center?: Point
@@ -129,6 +135,13 @@ export interface AutoroutingDrcEngineOptions {
    * Defaults to false so legacy callers receive the original error shape.
    */
   includeTraceViaOwnerMetadata?: boolean
+  /**
+   * Total budget for retained primitive geometry/keys, cached results, and entry overhead.
+   * Defaults to 8,000,000 accounting units; zero disables caching.
+   * Units count serialized key/error characters and fixed id/entry estimates.
+   * This is an accounting budget, not a byte or heap limit.
+   */
+  queryResultCacheBudget?: number
 }
 
 export interface AutoroutingDrcEngineRunStats {
@@ -191,27 +204,55 @@ const getObstacleLocalBounds = (obstacle: StaticObstacle): Bounds => ({
   maxY: obstacle.height / 2,
 })
 
-const getCellKey = (cellX: number, cellY: number) => `${cellX}:${cellY}`
-
 class SpatialHash<T> {
-  private readonly cells = new Map<string, T[]>()
+  private readonly cells = new Map<number, Map<number, number[]>>()
+  private readonly itemIds = new Map<T, number>()
+  private readonly rowItems: T[] = []
+  private visitedGenerations = new Uint32Array(0)
+  private queryGeneration = 0
 
   constructor(private readonly cellSize: number) {}
 
-  insert(item: T, bounds: Bounds) {
+  private registerItem(item: T): number {
+    const existingId = this.itemIds.get(item)
+    if (existingId !== undefined) return existingId
+
+    const itemId = this.rowItems.length
+    if (itemId >= this.visitedGenerations.length) {
+      const generations = new Uint32Array(
+        this.visitedGenerations.length === 0
+          ? 16
+          : this.visitedGenerations.length * 2,
+      )
+      generations.set(this.visitedGenerations)
+      this.visitedGenerations = generations
+    }
+    this.itemIds.set(item, itemId)
+    // Set iteration canonicalizes primitive negative zero to positive zero.
+    this.rowItems.push(item === 0 ? (0 as T) : item)
+    return itemId
+  }
+
+  insert(item: T, bounds: Bounds): void {
     const minCellX = Math.floor(bounds.minX / this.cellSize)
     const maxCellX = Math.floor(bounds.maxX / this.cellSize)
     const minCellY = Math.floor(bounds.minY / this.cellSize)
     const maxCellY = Math.floor(bounds.maxY / this.cellSize)
+    let itemId: number | undefined
 
     for (let cellX = minCellX; cellX <= maxCellX; cellX += 1) {
+      let column = this.cells.get(cellX)
+      if (!column && minCellY <= maxCellY) {
+        column = new Map<number, number[]>()
+        this.cells.set(cellX, column)
+      }
       for (let cellY = minCellY; cellY <= maxCellY; cellY += 1) {
-        const key = getCellKey(cellX, cellY)
-        const items = this.cells.get(key)
+        const items = column!.get(cellY)
+        if (itemId === undefined) itemId = this.registerItem(item)
         if (items) {
-          items.push(item)
+          items.push(itemId)
         } else {
-          this.cells.set(key, [item])
+          column!.set(cellY, [itemId])
         }
       }
     }
@@ -222,17 +263,36 @@ class SpatialHash<T> {
     const maxCellX = Math.floor(bounds.maxX / this.cellSize)
     const minCellY = Math.floor(bounds.minY / this.cellSize)
     const maxCellY = Math.floor(bounds.maxY / this.cellSize)
-    const results = new Set<T>()
+    let generation = this.queryGeneration + 1
+    if (generation > 0xffffffff) {
+      this.visitedGenerations.fill(0)
+      generation = 1
+    }
+    this.queryGeneration = generation
+    const results: T[] = []
 
     for (let cellX = minCellX; cellX <= maxCellX; cellX += 1) {
+      const column = this.cells.get(cellX)
+      // Keep the original loop for nonprogressing infinite/unsafe endpoints.
+      if (
+        !column &&
+        minCellY >= -9007199254740991 &&
+        maxCellY <= 9007199254740991
+      ) {
+        continue
+      }
       for (let cellY = minCellY; cellY <= maxCellY; cellY += 1) {
-        const items = this.cells.get(getCellKey(cellX, cellY))
+        const items = column?.get(cellY)
         if (!items) continue
-        for (const item of items) results.add(item)
+        for (const itemId of items) {
+          if (this.visitedGenerations[itemId] === generation) continue
+          this.visitedGenerations[itemId] = generation
+          results.push(this.rowItems[itemId]!)
+        }
       }
     }
 
-    return [...results]
+    return results
   }
 }
 
@@ -371,6 +431,8 @@ const createTraceErrorMessage = (
  * Static SRJ obstacle geometry and connectivity aliases are compiled once in
  * the constructor. Each evaluation builds only the route-dependent trace/via
  * broad phase and performs exact distance checks for nearby objects.
+ * The DRC query result cache reuses results only when exact primitive inputs
+ * and ordered candidate ids match. Connectivity changes invalidate results.
  *
  * This intentionally implements the checks used by the repair solver's
  * relaxed objective. It is not a replacement for the full-board
@@ -386,6 +448,32 @@ export class AutoroutingDrcEngine {
   private readonly canonicalNetByAlias = new Map<string, string>()
   private readonly connMapNetByCanonicalNet = new Map<string, string>()
   private readonly obstacles: StaticObstacle[]
+  private readonly queryResultBudget: number
+  private readonly primitiveKeyBudget: number
+  private readonly primitiveIdsByKey = new Map<
+    string,
+    { id: number; units: number }
+  >()
+  // Advance through FIFO entries instead of rescanning deleted Map slots.
+  private primitiveEvictionCursor = this.primitiveIdsByKey.entries()
+  private primitiveKeyUnits = 0
+  private geometryCacheUnits = 0
+  private reusableSegments: TraceSegment[] = []
+  private reusableVias: Via[] = []
+  private nextPrimitiveId = 0
+  private readonly staticObstacleIds = new WeakMap<StaticObstacle, number>()
+  private readonly queryResultCache = new Map<
+    string,
+    {
+      errors: AutoroutingDrcError[]
+      exactCheckCount: number
+      broadPhaseCandidateCount: number
+      units: number
+    }
+  >()
+  private queryEvictionCursor = this.queryResultCache.entries()
+  private queryResultUnits = 0
+  private cachedConnectivityKey?: string
   private readonly obstacleIndexesByLayer = new Map<
     string,
     SpatialHash<StaticObstacle>
@@ -404,6 +492,17 @@ export class AutoroutingDrcEngine {
     private readonly srj: SimpleRouteJson,
     options: AutoroutingDrcEngineOptions = {},
   ) {
+    const queryResultCacheBudget = options.queryResultCacheBudget ?? 8_000_000
+    if (
+      !Number.isSafeInteger(queryResultCacheBudget) ||
+      queryResultCacheBudget < 0
+    ) {
+      throw new Error(
+        "queryResultCacheBudget must be a nonnegative safe integer",
+      )
+    }
+    this.primitiveKeyBudget = Math.floor(queryResultCacheBudget / 4)
+    this.queryResultBudget = queryResultCacheBudget - this.primitiveKeyBudget
     this.traceClearance = options.traceClearance ?? DEFAULT_TRACE_CLEARANCE
     this.viaClearance = Math.max(
       options.viaClearance ?? MIN_VIA_CLEARANCE,
@@ -436,6 +535,9 @@ export class AutoroutingDrcEngine {
 
     this.compileConnectionAliases()
     this.obstacles = this.compileStaticObstacles()
+    this.obstacles.forEach((obstacle, index) =>
+      this.staticObstacleIds.set(obstacle, index),
+    )
     this.indexStaticObstacles()
   }
 
@@ -552,16 +654,18 @@ export class AutoroutingDrcEngine {
         translate(obstacle.center.x, obstacle.center.y),
         rotateDEG(hasRotation ? obstacle.ccwRotationDegrees! : 0),
       )
-      // Explicit rotation describes a rectangular pad, including square pads.
-      // Only legacy, unrotated multilayer obstacles use the circular inference.
+      // Honor declared circles, including SMT pads. Infer circles only for
+      // legacy unrotated multilayer obstacles with equal dimensions.
       const isCircular =
-        !hasRotation &&
-        isMultiLayer &&
-        Math.abs(obstacle.width - obstacle.height) < 0.001
+        obstacle.shape === "circle" ||
+        (!hasRotation &&
+          isMultiLayer &&
+          Math.abs(obstacle.width - obstacle.height) < 0.001)
       obstacles.push({
         kind: "obstacle",
         obstacleType,
         obstacleId,
+        shape: obstacle.shape,
         connectedTo: obstacle.connectedTo,
         x: obstacle.center.x,
         y: obstacle.center.y,
@@ -597,16 +701,31 @@ export class AutoroutingDrcEngine {
     }
   }
 
-  private collectDynamicGeometry(traces: SimplifiedPcbTraces) {
+  private collectDynamicGeometry(
+    traces: SimplifiedPcbTraces,
+    {
+      cachePrimitives = true,
+      traceIds,
+    }: { cachePrimitives?: boolean; traceIds?: ReadonlySet<string> } = {},
+  ): { segments: TraceSegment[]; vias: Via[] } {
     const segments: TraceSegment[] = []
     const vias: Via[] = []
     const viaLocations = new Set<string>()
 
     for (const trace of traces) {
-      const netId = this.resolveNetId(trace.connection_name)
-      const pcbPortIds = getTracePortIds(trace)
+      const includeTrace = !traceIds || traceIds.has(trace.pcb_trace_id)
+      const netId = includeTrace ? this.resolveNetId(trace.connection_name) : ""
+      const pcbPortIds = includeTrace ? getTracePortIds(trace) : []
+      const traceOwnershipKey =
+        includeTrace && this.queryResultBudget && cachePrimitives
+          ? JSON.stringify([trace.pcb_trace_id, netId, pcbPortIds])
+          : undefined
 
-      for (let index = 0; index < trace.route.length - 1; index += 1) {
+      for (
+        let index = 0;
+        includeTrace && index < trace.route.length - 1;
+        index += 1
+      ) {
         const start = trace.route[index]
         const end = trace.route[index + 1]
         if (
@@ -623,6 +742,26 @@ export class AutoroutingDrcEngine {
           continue
         }
 
+        const previous = cachePrimitives
+          ? this.reusableSegments[segments.length]
+          : undefined
+        if (
+          previous &&
+          previous.traceId === trace.pcb_trace_id &&
+          previous.netId === netId &&
+          Object.is(previous.start.x, start.x) &&
+          Object.is(previous.start.y, start.y) &&
+          Object.is(previous.end.x, end.x) &&
+          Object.is(previous.end.y, end.y) &&
+          Object.is(previous.width, getWireWidth(start, end)) &&
+          previous.layer === start.layer &&
+          previous.pcbPortIds.length === pcbPortIds.length &&
+          previous.pcbPortIds.every((id, index) => id === pcbPortIds[index])
+        ) {
+          segments.push(previous)
+          continue
+        }
+
         segments.push({
           kind: "trace_segment",
           order: segments.length,
@@ -633,6 +772,19 @@ export class AutoroutingDrcEngine {
           width: getWireWidth(start, end),
           layer: start.layer,
           pcbPortIds,
+          primitiveId:
+            traceOwnershipKey === undefined
+              ? undefined
+              : this.getPrimitiveId([
+                  "trace",
+                  traceOwnershipKey,
+                  start.x,
+                  start.y,
+                  end.x,
+                  end.y,
+                  getWireWidth(start, end),
+                  start.layer,
+                ]),
         })
       }
 
@@ -641,22 +793,97 @@ export class AutoroutingDrcEngine {
         const locationKey = `${routePoint.x},${routePoint.y},${routePoint.from_layer},${routePoint.to_layer}`
         if (viaLocations.has(locationKey)) continue
         viaLocations.add(locationKey)
+        // Every trace still claims its via locations in original order. An
+        // unselected owner must suppress later duplicates exactly as in full DRC.
+        if (!includeTrace) continue
 
+        const viaId = `via_${viaLocations.size - 1}`
+        const diameter =
+          routePoint.via_diameter ?? this.srj.minViaDiameter ?? 0.3
+        const holeDiameter =
+          routePoint.via_hole_diameter ??
+          this.srj.min_via_hole_diameter ??
+          this.srj.minViaHoleDiameter ??
+          diameter / 2
+        const layers = getViaDrillLayers({
+          via: routePoint,
+          layerCount: this.srj.layerCount,
+          allowBlindAndBuriedVias: this.srj.allowBlindAndBuriedVias,
+        })
+        const previous = cachePrimitives
+          ? this.reusableVias[vias.length]
+          : undefined
+        if (
+          previous &&
+          previous.viaId === viaId &&
+          previous.traceId === trace.pcb_trace_id &&
+          previous.netId === netId &&
+          Object.is(previous.x, routePoint.x) &&
+          Object.is(previous.y, routePoint.y) &&
+          Object.is(previous.diameter, diameter) &&
+          Object.is(previous.holeDiameter, holeDiameter) &&
+          previous.layers.length === layers.length &&
+          previous.layers.every((layer, index) => layer === layers[index])
+        ) {
+          vias.push(previous)
+          continue
+        }
         vias.push({
           kind: "via",
-          order: vias.length,
-          viaId: `via_${vias.length}`,
+          order: viaLocations.size - 1,
+          viaId,
           traceId: trace.pcb_trace_id,
           netId,
           x: routePoint.x,
           y: routePoint.y,
-          diameter: routePoint.via_diameter ?? this.srj.minViaDiameter ?? 0.3,
-          layers: getViaDrillLayers(
-            routePoint,
-            this.srj.layerCount,
-            this.srj.allowBlindAndBuriedVias,
-          ),
+          diameter,
+          holeDiameter,
+          layers,
+          primitiveId:
+            this.queryResultBudget && cachePrimitives
+              ? this.getPrimitiveId([
+                  "via",
+                  viaId,
+                  trace.pcb_trace_id,
+                  netId,
+                  routePoint.x,
+                  routePoint.y,
+                  diameter,
+                  holeDiameter,
+                  layers,
+                ])
+              : undefined,
         })
+      }
+    }
+
+    if (cachePrimitives) {
+      // Retain only a bounded prefix from the last complete evaluation. Exact
+      // field comparisons detect in-place edits without serializing every
+      // unchanged primitive again. IDs never recycle, even after key eviction.
+      const geometryBudget = Math.floor(this.primitiveKeyBudget / 2)
+      this.geometryCacheUnits = 0
+      this.reusableVias = []
+      this.reusableSegments = []
+      for (const via of vias) {
+        const units = 128 + via.layers.length * 8
+        if (this.geometryCacheUnits + units > geometryBudget) break
+        this.reusableVias.push(via)
+        this.geometryCacheUnits += units
+      }
+      for (const segment of segments) {
+        const units = 128 + segment.pcbPortIds.length * 8
+        if (this.geometryCacheUnits + units > geometryBudget) break
+        this.reusableSegments.push(segment)
+        this.geometryCacheUnits += units
+      }
+      while (
+        this.primitiveKeyUnits + this.geometryCacheUnits >
+        this.primitiveKeyBudget
+      ) {
+        const [oldestKey, oldest] = this.primitiveEvictionCursor.next().value!
+        this.primitiveKeyUnits -= oldest.units
+        this.primitiveIdsByKey.delete(oldestKey)
       }
     }
 
@@ -697,6 +924,138 @@ export class AutoroutingDrcEngine {
     return obstacle.connectedTo.some((connectedId) =>
       this.areConnected(netId, connectedId),
     )
+  }
+
+  private getPrimitiveId(values: unknown[]): number | undefined {
+    if (!this.primitiveKeyBudget) return undefined
+    const key = JSON.stringify(
+      values.map((value) => {
+        if (typeof value !== "number") return value
+        if (Object.is(value, -0)) return "-0"
+        if (Number.isNaN(value)) return "NaN"
+        if (value === Infinity) return "+Infinity"
+        if (value === -Infinity) return "-Infinity"
+        return value
+      }),
+    )
+    const existing = this.primitiveIdsByKey.get(key)
+    if (existing) return existing.id
+    const units = key.length + 64
+    const availableBudget = this.primitiveKeyBudget - this.geometryCacheUnits
+    if (
+      units > availableBudget ||
+      this.nextPrimitiveId >= Number.MAX_SAFE_INTEGER
+    )
+      return undefined
+    while (this.primitiveKeyUnits + units > availableBudget) {
+      const [oldestKey, oldest] = this.primitiveEvictionCursor.next().value!
+      this.primitiveKeyUnits -= oldest.units
+      this.primitiveIdsByKey.delete(oldestKey)
+    }
+    const id = this.nextPrimitiveId++
+    this.primitiveIdsByKey.set(key, { id, units })
+    this.primitiveKeyUnits += units
+    return id
+  }
+
+  private getQueryCacheKey(
+    kind: string,
+    ids: Array<number | undefined>,
+  ): string | undefined {
+    if (!this.queryResultBudget || ids.some((id) => id === undefined))
+      return undefined
+    return `${kind}:${ids.join(",")}`
+  }
+
+  private runCachedQuery(
+    key: string | undefined,
+    compute: () => AutoroutingDrcError[],
+  ): AutoroutingDrcError[] {
+    const existing =
+      key === undefined ? undefined : this.queryResultCache.get(key)
+    if (existing) {
+      // Preserve logical check counts on cache hits, including queries with no errors.
+      this.lastRunStats.exactCheckCount += existing.exactCheckCount
+      this.lastRunStats.broadPhaseCandidateCount +=
+        existing.broadPhaseCandidateCount
+      // Query results stay internal until the deduplicated public result is
+      // copied. Repeated contacts should not each deep-copy the same error.
+      return existing.errors
+    }
+    const initialExactCheckCount = this.lastRunStats.exactCheckCount
+    const initialBroadPhaseCandidateCount =
+      this.lastRunStats.broadPhaseCandidateCount
+    const errors = compute()
+    if (key === undefined) return errors
+    const units =
+      key.length +
+      (errors.length ? JSON.stringify(errors).length : 0) +
+      errors.length * 64 +
+      64
+    if (units > this.queryResultBudget) return errors
+    while (this.queryResultUnits + units > this.queryResultBudget) {
+      const [oldestKey, oldest] = this.queryEvictionCursor.next().value!
+      this.queryResultUnits -= oldest.units
+      this.queryResultCache.delete(oldestKey)
+    }
+    this.queryResultCache.set(key, {
+      // These records are engine-owned. evaluateInternal copies the final
+      // public result, so storing them does not expose cached objects to callers.
+      errors,
+      exactCheckCount:
+        this.lastRunStats.exactCheckCount - initialExactCheckCount,
+      broadPhaseCandidateCount:
+        this.lastRunStats.broadPhaseCandidateCount -
+        initialBroadPhaseCandidateCount,
+      units,
+    })
+    this.queryResultUnits += units
+    return errors
+  }
+
+  private checkTraceQuery(
+    segment: TraceSegment,
+    dynamicCandidates: DynamicCollidable[],
+    obstacleCandidates: StaticObstacle[],
+  ): AutoroutingDrcError[] {
+    this.lastRunStats.broadPhaseCandidateCount +=
+      dynamicCandidates.length + obstacleCandidates.length
+    let key: string | undefined
+    if (this.queryResultBudget) {
+      const ids: Array<number | undefined> = [segment.primitiveId]
+      for (const candidate of dynamicCandidates) {
+        if (
+          candidate.kind === "trace_segment" &&
+          candidate.order <= segment.order
+        )
+          continue
+        ids.push(candidate.primitiveId)
+      }
+      ids.push(-1)
+      for (const obstacle of obstacleCandidates)
+        ids.push(this.staticObstacleIds.get(obstacle))
+      key = this.getQueryCacheKey("trace", ids)
+    }
+    return this.runCachedQuery(key, () => {
+      const errors: AutoroutingDrcError[] = []
+      for (const candidate of dynamicCandidates) {
+        if (
+          candidate.kind === "trace_segment" &&
+          candidate.order <= segment.order
+        )
+          continue
+        const error =
+          candidate.kind === "trace_segment"
+            ? this.checkTracePair(segment, candidate)
+            : this.checkTraceVia(segment, candidate)
+        if (error) errors.push(error)
+      }
+      for (const obstacle of obstacleCandidates) {
+        const error = this.checkTraceObstacle(segment, obstacle)
+        if (error) errors.push(error)
+      }
+      return errors
+    })
   }
 
   private checkTracePair(
@@ -851,13 +1210,18 @@ export class AutoroutingDrcEngine {
     via: Via,
     obstacle: StaticObstacle,
   ): AutoroutingDrcError | undefined {
-    if (this.obstacleSharesNet(via.netId, obstacle)) return undefined
+    const sameNet = this.obstacleSharesNet(via.netId, obstacle)
+    if (sameNet && this.srj.allowViaInPad !== false) return undefined
     this.lastRunStats.exactCheckCount += 1
 
     const obstacleBounds = getObstacleLocalBounds(obstacle)
     const localVia = applyToPoint(obstacle.worldToLocal, via)
+    const radius =
+      sameNet && obstacle.shape === "circle"
+        ? Math.min(obstacle.width, obstacle.height) / 2
+        : obstacle.radius
     const pointToObstacleDistance =
-      obstacle.radius === undefined
+      radius === undefined
         ? Math.hypot(
             Math.max(
               obstacleBounds.minX - localVia.x,
@@ -870,10 +1234,16 @@ export class AutoroutingDrcEngine {
               localVia.y - obstacleBounds.maxY,
             ),
           )
-        : Math.hypot(via.x - obstacle.x, via.y - obstacle.y) - obstacle.radius
-    const gap = pointToObstacleDistance - via.diameter / 2
-    if (gap + DRC_EPSILON >= this.viaToPadClearance) return undefined
+        : Math.hypot(via.x - obstacle.x, via.y - obstacle.y) - radius
+    const diameter = sameNet ? via.holeDiameter : via.diameter
+    const minimumClearance = sameNet ? 0 : this.viaToPadClearance
+    const tolerance = sameNet ? POSITION_EPSILON : DRC_EPSILON
+    const gap = pointToObstacleDistance - diameter / 2
+    if (gap + tolerance >= minimumClearance) return undefined
 
+    const errorType = sameNet
+      ? "pcb_placement_error"
+      : "pcb_pad_pad_clearance_error"
     const errorId = `via_pad_clearance_${via.viaId}_${obstacle.obstacleId}`
     const center = {
       x: (via.x + obstacle.x) / 2,
@@ -881,20 +1251,30 @@ export class AutoroutingDrcEngine {
     }
 
     return {
-      type: "pcb_pad_pad_clearance_error",
-      error_type: "pcb_pad_pad_clearance_error",
-      pcb_pad_pad_clearance_error_id: errorId,
+      type: errorType,
+      error_type: errorType,
+      [`${errorType}_id`]: errorId,
       message: `pcb_via "${via.viaId}" and ${obstacle.obstacleType} "${obstacle.obstacleId}" are too close (gap: ${gap.toFixed(3)}mm)`,
       pcb_trace_id: via.traceId,
       pcb_pad_ids: [via.viaId, obstacle.obstacleId],
       pcb_via_ids: [via.viaId],
-      minimum_clearance: this.viaToPadClearance,
+      minimum_clearance: minimumClearance,
       actual_clearance: gap,
       center,
     }
   }
 
   private checkViaPairs(vias: Via[]): AutoroutingDrcError[] {
+    const key = this.queryResultBudget
+      ? this.getQueryCacheKey(
+          "via-pairs",
+          vias.map((via) => via.primitiveId),
+        )
+      : undefined
+    return this.runCachedQuery(key, () => this.computeViaPairs(vias))
+  }
+
+  private computeViaPairs(vias: Via[]): AutoroutingDrcError[] {
     if (vias.length < 2) return []
     const errors: AutoroutingDrcError[] = []
     const index = new SpatialHash<Via>(this.cellSize)
@@ -944,8 +1324,71 @@ export class AutoroutingDrcEngine {
     return errors
   }
 
+  private checkViaPadQuery(via: Via): AutoroutingDrcError[] {
+    const key = this.getQueryCacheKey("via-pad", [via.primitiveId])
+    return this.runCachedQuery(key, () => {
+      const errors: AutoroutingDrcError[] = []
+      const checkedObstacles = new Set<StaticObstacle>()
+      for (const layer of via.layers) {
+        const obstacleCandidates =
+          this.obstacleIndexesByLayer.get(layer)?.query(getViaBounds(via)) ?? []
+        for (const obstacle of obstacleCandidates) {
+          if (checkedObstacles.has(obstacle)) continue
+          checkedObstacles.add(obstacle)
+          this.lastRunStats.broadPhaseCandidateCount += 1
+          const error = this.checkViaObstacle(via, obstacle)
+          if (error) errors.push(error)
+        }
+      }
+      return errors
+    })
+  }
+
   evaluate(traces: SimplifiedPcbTraces): AutoroutingDrcResult {
     return this.evaluateInternal(traces, true)
+  }
+
+  /** Static-contact rejection without rebuilding the whole-board copper index.
+   * Preserve the statistics from the caller's last complete DRC evaluation. */
+  getObstacleContactErrors(
+    traces: SimplifiedPcbTraces,
+    traceIds?: ReadonlySet<string>,
+  ): AutoroutingDrcError[] {
+    const previousStats = this.lastRunStats
+    this.lastRunStats = { ...previousStats }
+    try {
+      const { segments, vias } = this.collectDynamicGeometry(traces, {
+        cachePrimitives: false,
+        traceIds,
+      })
+      const errors: AutoroutingDrcError[] = []
+      for (const segment of segments) {
+        const obstacles = this.obstacleIndexesByLayer
+          .get(segment.layer)
+          ?.query(getSegmentBounds(segment))
+        for (const obstacle of obstacles ?? []) {
+          const error = this.checkTraceObstacle(segment, obstacle)
+          if (error) errors.push(error)
+        }
+      }
+      for (const via of vias) {
+        const checked = new Set<StaticObstacle>()
+        for (const layer of via.layers) {
+          const obstacles = this.obstacleIndexesByLayer
+            .get(layer)
+            ?.query(getViaBounds(via))
+          for (const obstacle of obstacles ?? []) {
+            if (checked.has(obstacle)) continue
+            checked.add(obstacle)
+            const error = this.checkViaObstacle(via, obstacle)
+            if (error) errors.push(error)
+          }
+        }
+      }
+      return errors
+    } finally {
+      this.lastRunStats = previousStats
+    }
   }
 
   /**
@@ -961,6 +1404,18 @@ export class AutoroutingDrcEngine {
     traces: SimplifiedPcbTraces,
     includeViaPadErrors: boolean,
   ): AutoroutingDrcResult {
+    if (this.queryResultBudget) {
+      const connectivityKey = JSON.stringify([
+        this.connMap?.idToNetMap,
+        this.obstacles.map((obstacle) => obstacle.connectedTo),
+      ])
+      if (connectivityKey !== this.cachedConnectivityKey) {
+        this.queryResultCache.clear()
+        this.queryEvictionCursor = this.queryResultCache.entries()
+        this.queryResultUnits = 0
+        this.cachedConnectivityKey = connectivityKey
+      }
+    }
     const { segments, vias } = this.collectDynamicGeometry(traces)
     const dynamicIndexesByLayer = this.buildDynamicIndexes(segments, vias)
     const detectedTraceErrors: AutoroutingDrcError[] = []
@@ -982,46 +1437,16 @@ export class AutoroutingDrcEngine {
       const obstacleCandidates =
         this.obstacleIndexesByLayer.get(segment.layer)?.query(queryBounds) ?? []
 
-      for (const candidate of dynamicCandidates) {
-        this.lastRunStats.broadPhaseCandidateCount += 1
-        if (
-          candidate.kind === "trace_segment" &&
-          candidate.order <= segment.order
-        ) {
-          continue
-        }
-
-        const error =
-          candidate.kind === "trace_segment"
-            ? this.checkTracePair(segment, candidate)
-            : this.checkTraceVia(segment, candidate)
-        if (error) detectedTraceErrors.push(error)
-      }
-
-      for (const obstacle of obstacleCandidates) {
-        this.lastRunStats.broadPhaseCandidateCount += 1
-        const error = this.checkTraceObstacle(segment, obstacle)
-        if (error) detectedTraceErrors.push(error)
-      }
+      detectedTraceErrors.push(
+        ...this.checkTraceQuery(segment, dynamicCandidates, obstacleCandidates),
+      )
     }
 
     const detectedViaErrors = this.checkViaPairs(vias)
 
     if (includeViaPadErrors) {
       for (const via of vias) {
-        const checkedObstacles = new Set<StaticObstacle>()
-        for (const layer of via.layers) {
-          const obstacleCandidates =
-            this.obstacleIndexesByLayer.get(layer)?.query(getViaBounds(via)) ??
-            []
-          for (const obstacle of obstacleCandidates) {
-            if (checkedObstacles.has(obstacle)) continue
-            checkedObstacles.add(obstacle)
-            this.lastRunStats.broadPhaseCandidateCount += 1
-            const error = this.checkViaObstacle(via, obstacle)
-            if (error) detectedViaPadErrors.push(error)
-          }
-        }
+        detectedViaPadErrors.push(...this.checkViaPadQuery(via))
       }
     }
 
@@ -1071,13 +1496,18 @@ export class AutoroutingDrcEngine {
     )
     errors.push(...detectedViaPadErrors)
     errors.push(...detectedViaErrors)
-    const errorsWithCenters = errors.filter((error) => error.center)
+    // Isolate callers from cached records after duplicate trace contacts have
+    // been collapsed, preserving shared records across the public result views.
+    const outputErrors = this.queryResultBudget
+      ? structuredClone(errors)
+      : errors
+    const errorsWithCenters = outputErrors.filter((error) => error.center)
     const locationAwareErrors = errorsWithCenters as Array<
       AutoroutingDrcError & { center: Point }
     >
 
     return {
-      errors,
+      errors: outputErrors,
       errorsWithCenters,
       locationAwareErrors,
     }

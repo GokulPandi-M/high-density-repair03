@@ -1,5 +1,7 @@
 import { expect, spyOn, test } from "bun:test"
 import { ConnectivityMap } from "circuit-json-to-connectivity-map"
+import { readFileSync } from "node:fs"
+import { gunzipSync } from "node:zlib"
 import {
   AutoroutingDrcEngine,
   GlobalDrcBranchPortfolioSolver,
@@ -9,14 +11,23 @@ import {
 } from "../lib"
 import * as helpers from "../lib/solvers/GlobalDrcForceImproveSolver/solverHelpers"
 import recordedOutputs from "./fixtures/usb-portfolio-branch-outputs.json"
-import recordedInput from "./fixtures/usb-portfolio-repair-input.json"
 
 test("keeps an accepted safe-layer candidate when a later broad branch only ties it", () => {
-  // Unchanged CC1 repair input captured from the native USB fixture using
-  // the autorouter's existing repair03 pin (5f6c9af). No routes are authored.
-  const repair = recordedInput as {
-    srj: SimpleRouteJson
+  // Genuine CC1 constructor input from the native USB circuit, not a branch
+  // output. Capture provenance is alongside the fixture. Native USB integration
+  // tests continue to render the complete circuit separately.
+  const repair = JSON.parse(
+    gunzipSync(
+      readFileSync(
+        new URL(
+          "./fixtures/usb-portfolio-branch-input.json.gz",
+          import.meta.url,
+        ),
+      ),
+    ).toString("utf8"),
+  ) as {
     input: HighDensityRoute[]
+    srj: SimpleRouteJson
     netMap: Record<string, string[]>
   }
   const originalInput = structuredClone(repair.input)

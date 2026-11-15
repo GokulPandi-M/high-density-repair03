@@ -26,14 +26,29 @@ const getSpatialCellRange = (bounds: Bounds2D, cellSize: number) => ({
   maxCellY: Math.floor(bounds.maxY / cellSize),
 })
 
-const getSpatialCellKey = (cellX: number, cellY: number) => `${cellX}:${cellY}`
+// Numeric columns avoid allocating and hashing a string for every queried cell.
+export type SpatialIndex = Map<number, Map<number, number[]>>
+
+type SpatialQueryScratch = {
+  bits: Uint32Array
+  wordGenerations: Uint32Array
+  generation: number
+}
+
+const queryScratchByIndex = new WeakMap<SpatialIndex, SpatialQueryScratch>()
 
 export const createSpatialIndex = <T>(
   items: T[],
   getBounds: (item: T) => Bounds2D,
   cellSize: number,
-) => {
-  const index = new Map<string, number[]>()
+): SpatialIndex => {
+  const index: SpatialIndex = new Map()
+  const wordCount = Math.ceil(items.length / 32)
+  queryScratchByIndex.set(index, {
+    bits: new Uint32Array(wordCount),
+    wordGenerations: new Uint32Array(wordCount),
+    generation: 0,
+  })
 
   for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
     const item = items[itemIndex]
@@ -45,17 +60,21 @@ export const createSpatialIndex = <T>(
       cellX <= cellRange.maxCellX;
       cellX += 1
     ) {
+      let column = index.get(cellX)
+      if (!column) {
+        column = new Map<number, number[]>()
+        index.set(cellX, column)
+      }
       for (
         let cellY = cellRange.minCellY;
         cellY <= cellRange.maxCellY;
         cellY += 1
       ) {
-        const key = getSpatialCellKey(cellX, cellY)
-        const existingIndexes = index.get(key)
+        const existingIndexes = column.get(cellY)
         if (existingIndexes) {
           existingIndexes.push(itemIndex)
         } else {
-          index.set(key, [itemIndex])
+          column.set(cellY, [itemIndex])
         }
       }
     }
@@ -65,30 +84,80 @@ export const createSpatialIndex = <T>(
 }
 
 export const getSpatialCandidateIndexes = (
-  spatialIndex: Map<string, number[]>,
+  spatialIndex: SpatialIndex,
   bounds: Bounds2D,
   cellSize: number,
-) => {
-  const candidateIndexes = new Set<number>()
+): number[] => {
+  let scratch = queryScratchByIndex.get(spatialIndex)
+  if (!scratch) {
+    scratch = {
+      bits: new Uint32Array(0),
+      wordGenerations: new Uint32Array(0),
+      generation: 0,
+    }
+    queryScratchByIndex.set(spatialIndex, scratch)
+  }
+  scratch.generation += 1
+  if (scratch.generation > 0xffffffff) {
+    scratch.wordGenerations.fill(0)
+    scratch.generation = 1
+  }
+  const generation = scratch.generation
   const cellRange = getSpatialCellRange(bounds, cellSize)
+  let minWordIndex = Infinity
+  let maxWordIndex = -1
 
   for (
     let cellX = cellRange.minCellX;
     cellX <= cellRange.maxCellX;
     cellX += 1
   ) {
+    const column = spatialIndex.get(cellX)
+    if (!column) continue
     for (
       let cellY = cellRange.minCellY;
       cellY <= cellRange.maxCellY;
       cellY += 1
     ) {
-      const cellIndexes = spatialIndex.get(getSpatialCellKey(cellX, cellY))
+      const cellIndexes = column.get(cellY)
       if (!cellIndexes) continue
       for (const index of cellIndexes) {
-        candidateIndexes.add(index)
+        const wordIndex = index >>> 5
+        if (wordIndex >= scratch.bits.length) {
+          const wordCount = Math.max(wordIndex + 1, scratch.bits.length * 2)
+          const nextBits = new Uint32Array(wordCount)
+          nextBits.set(scratch.bits)
+          const nextGenerations = new Uint32Array(wordCount)
+          nextGenerations.set(scratch.wordGenerations)
+          scratch.bits = nextBits
+          scratch.wordGenerations = nextGenerations
+        }
+        if (scratch.wordGenerations[wordIndex] !== generation) {
+          scratch.wordGenerations[wordIndex] = generation
+          scratch.bits[wordIndex] = 0
+        }
+        scratch.bits[wordIndex] = scratch.bits[wordIndex]! | (1 << (index & 31))
+        if (wordIndex < minWordIndex) minWordIndex = wordIndex
+        if (wordIndex > maxWordIndex) maxWordIndex = wordIndex
       }
     }
   }
 
-  return [...candidateIndexes].sort((left, right) => left - right)
+  // Bit positions retain the original item order across overlapping cells,
+  // without allocating a Set or sorting a fresh array for every query.
+  const candidateIndexes: number[] = []
+  for (
+    let wordIndex = minWordIndex;
+    wordIndex <= maxWordIndex;
+    wordIndex += 1
+  ) {
+    if (scratch.wordGenerations[wordIndex] !== generation) continue
+    let bits = scratch.bits[wordIndex]!
+    while (bits !== 0) {
+      const bitIndex = 31 - Math.clz32(bits & -bits)
+      candidateIndexes.push(wordIndex * 32 + bitIndex)
+      bits &= bits - 1
+    }
+  }
+  return candidateIndexes
 }

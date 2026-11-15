@@ -33,8 +33,9 @@ import {
   createSpatialIndex,
   expandBounds2d,
   getSpatialCandidateIndexes,
+  type SpatialIndex,
 } from "./spatialIndex"
-import type { DrcEvaluator, DrcSnapshot } from "./types"
+import type { DrcEvaluator, DrcSnapshot, PcbTraceId } from "./types"
 import type {
   Bounds2D,
   MutableRoute,
@@ -48,6 +49,10 @@ import { convertHdRouteToSimplifiedRoute } from "../../utils/convertHdRouteToSim
 import { mapZToLayerName } from "../../utils/mapZToLayerName"
 import { findPadClearanceViaPosition } from "./findPadClearanceViaPosition"
 import { findTraceClearanceViaPositions } from "./findTraceClearanceViaPositions"
+import {
+  createBroadNetMatchers,
+  type BroadNetMatchers,
+} from "./broadNetMatchers"
 
 const cloneRoute = (route: HighDensityRoute): MutableRoute => ({
   ...route,
@@ -100,12 +105,15 @@ export const isTraceObstacleDrcError = (error: Record<string, unknown>) => {
 const createSimplifiedTraces = (
   srj: SimpleRouteJson,
   routes: HighDensityRoute[],
+  includeTraces = true,
 ): {
   traces: SimplifiedPcbTraces
   traceRouteIndexById: Map<string, number>
+  traceConnectionNameById: Map<PcbTraceId, string>
 } => {
   const traces: SimplifiedPcbTraces = []
   const traceRouteIndexById = new Map<string, number>()
+  const traceConnectionNameById = new Map<PcbTraceId, string>()
   const routesByConnectionName = new Map<
     string,
     Array<{ route: HighDensityRoute; routeIndex: number }>
@@ -129,32 +137,34 @@ const createSimplifiedTraces = (
       if (!hdRoute) continue
       const traceId = `${connection.name}_${i}`
 
-      traces.push({
-        type: "pcb_trace",
-        pcb_trace_id: traceId,
-        connection_name:
-          connection.netConnectionName ??
-          connection.rootConnectionName ??
-          connection.name,
-        route: convertHdRouteToSimplifiedRoute(
-          hdRoute.route.route,
-          srj.layerCount,
-          {
-            traceThickness:
-              hdRoute.route.traceThickness ??
-              connection.nominalTraceWidth ??
-              srj.nominalTraceWidth ??
-              srj.minTraceWidth,
-            viaDiameter: hdRoute.route.viaDiameter ?? srj.minViaDiameter,
-            connectionPoints: connection.pointsToConnect,
-          },
-        ),
-      })
+      if (includeTraces)
+        traces.push({
+          type: "pcb_trace",
+          pcb_trace_id: traceId,
+          connection_name:
+            connection.netConnectionName ??
+            connection.rootConnectionName ??
+            connection.name,
+          route: convertHdRouteToSimplifiedRoute(
+            hdRoute.route.route,
+            srj.layerCount,
+            {
+              traceThickness:
+                hdRoute.route.traceThickness ??
+                connection.nominalTraceWidth ??
+                srj.nominalTraceWidth ??
+                srj.minTraceWidth,
+              viaDiameter: hdRoute.route.viaDiameter ?? srj.minViaDiameter,
+              connectionPoints: connection.pointsToConnect,
+            },
+          ),
+        })
       traceRouteIndexById.set(traceId, hdRoute.routeIndex)
+      traceConnectionNameById.set(traceId, connection.name)
     }
   }
 
-  return { traces, traceRouteIndexById }
+  return { traces, traceRouteIndexById, traceConnectionNameById }
 }
 
 const getDrcErrorSeverity = (error: Record<string, unknown>) => {
@@ -238,11 +248,13 @@ const createDrcSnapshot = (
   autoroutingDrcEngine?: AutoroutingDrcEngine,
   policy: DrcSnapshotPolicy = STANDARD_DRC_SNAPSHOT_POLICY,
 ): DrcSnapshot => {
-  const drcSrj =
-    autoroutingDrcEngine && !drcEvaluator
+  const routesOnlyEvaluator = drcEvaluator?.inputMode === "routes-only"
+  let drcSrj =
+    (autoroutingDrcEngine && !drcEvaluator) || routesOnlyEvaluator
       ? srj
       : getConnMapAwareSrj(srj, connMap)
-  const { traces, traceRouteIndexById } = createSimplifiedTraces(drcSrj, routes)
+  let { traces, traceRouteIndexById, traceConnectionNameById } =
+    createSimplifiedTraces(drcSrj, routes, !routesOnlyEvaluator)
   const drcResult = drcEvaluator?.({
     srj: drcSrj,
     routes,
@@ -260,6 +272,7 @@ const createDrcSnapshot = (
     >
 
     return {
+      rawErrors: errors,
       errors: errorsWithCenters,
       count: errors.length,
       issueScore: getDrcIssueScore(errorsWithCenters, policy.getErrorSeverity),
@@ -268,7 +281,18 @@ const createDrcSnapshot = (
         policy.getErrorSeverity,
       ),
       traceRouteIndexById,
+      traceConnectionNameById,
     }
+  }
+
+  // Preserve the established fallback input even if an opted-in external
+  // evaluator returns no result at runtime.
+  if (routesOnlyEvaluator) {
+    drcSrj = getConnMapAwareSrj(srj, connMap)
+    const fallbackInput = createSimplifiedTraces(drcSrj, routes)
+    traces = fallbackInput.traces
+    traceRouteIndexById = fallbackInput.traceRouteIndexById
+    traceConnectionNameById = fallbackInput.traceConnectionNameById
   }
 
   const drc =
@@ -297,6 +321,7 @@ const createDrcSnapshot = (
     policy.projectEngineError(error as unknown as Record<string, unknown>),
   )
   return {
+    rawErrors,
     errors: rawErrorsWithCenters,
     count: rawErrors.length,
     issueScore: getDrcIssueScore(rawErrorsWithCenters, policy.getErrorSeverity),
@@ -305,6 +330,7 @@ const createDrcSnapshot = (
       policy.getErrorSeverity,
     ),
     traceRouteIndexById,
+    traceConnectionNameById,
   }
 }
 
@@ -349,13 +375,14 @@ export const collectViaNodes = (
   for (let routeIndex = 0; routeIndex < routes.length; routeIndex += 1) {
     const route = routes[routeIndex]
     if (!route) continue
-    const seenIndexes = new Set<number>()
+    let seenIndexes: Set<number> | undefined
 
     for (let index = 0; index < route.route.length - 1; index += 1) {
       const current = route.route[index]
       const next = route.route[index + 1]
       if (!current || !next) continue
       if (current.z === next.z || !areSameXY(current, next)) continue
+      const routeSeenIndexes = (seenIndexes ??= new Set<number>())
 
       const pointIndexes = [index, index + 1]
       for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
@@ -369,14 +396,17 @@ export const collectViaNodes = (
         pointIndexes.push(cursor)
       }
 
-      const uniquePointIndexes = [...new Set(pointIndexes)]
+      // The initial pair and the two disjoint cursor ranges never repeat an index.
+      const uniquePointIndexes = pointIndexes
       if (
-        uniquePointIndexes.some((pointIndex) => seenIndexes.has(pointIndex))
+        uniquePointIndexes.some((pointIndex) =>
+          routeSeenIndexes.has(pointIndex),
+        )
       ) {
         continue
       }
       for (const pointIndex of uniquePointIndexes) {
-        seenIndexes.add(pointIndex)
+        routeSeenIndexes.add(pointIndex)
       }
 
       const endpointPointIndexes = uniquePointIndexes.filter(
@@ -387,11 +417,13 @@ export const collectViaNodes = (
         Boolean(route.route[pointIndex]?.pcb_port_id),
       )
 
-      const endpointZ = uniquePointIndexes.map((i) => route.route[i]!.z)
-      const minZ = srj.allowBlindAndBuriedVias ? Math.min(...endpointZ) : 0
-      const maxZ = srj.allowBlindAndBuriedVias
-        ? Math.max(...endpointZ)
-        : srj.layerCount - 1
+      let minZ = 0
+      let maxZ = srj.layerCount - 1
+      if (srj.allowBlindAndBuriedVias) {
+        const endpointZ = uniquePointIndexes.map((i) => route.route[i]!.z)
+        minZ = Math.min(...endpointZ)
+        maxZ = Math.max(...endpointZ)
+      }
       vias.push({
         routeIndex,
         rootConnectionName: getRootConnectionName(route),
@@ -540,7 +572,14 @@ const pointToSegmentProjection = (point: Point, segment: Segment) =>
 export const getPointToObstacleDistance = (
   point: Point,
   obstacle: SimpleRouteJson["obstacles"][number],
-) => {
+): number => {
+  if (obstacle.shape === "circle") {
+    const centerDistance = Math.hypot(
+      point.x - obstacle.center.x,
+      point.y - obstacle.center.y,
+    )
+    return Math.max(0, centerDistance - obstacle.width / 2)
+  }
   const halfWidth = obstacle.width / 2
   const halfHeight = obstacle.height / 2
   const dx = Math.max(Math.abs(point.x - obstacle.center.x) - halfWidth, 0)
@@ -584,9 +623,9 @@ const getNearestObstacleNearPoint = (
     | undefined
 
   for (const obstacle of srj.obstacles) {
-    if (predicate && !predicate(obstacle)) continue
     const distance = getPointToObstacleDistance(point, obstacle)
     if (distance > maxDistance) continue
+    if (predicate && !predicate(obstacle)) continue
     if (!nearestObstacle || distance < nearestObstacle.distance) {
       nearestObstacle = {
         obstacle,
@@ -602,7 +641,19 @@ export const getRectRepulsion = (
   point: Point,
   obstacle: SimpleRouteJson["obstacles"][number],
   requiredDistance: number,
-) => {
+): { direction: Point; penetration: number } | undefined => {
+  if (obstacle.shape === "circle") {
+    const dx = point.x - obstacle.center.x
+    const dy = point.y - obstacle.center.y
+    const distance = Math.hypot(dx, dy)
+    const penetration = requiredDistance + obstacle.width / 2 - distance
+    if (penetration <= 0) return undefined
+    let direction: Point = { x: 1, y: 0 }
+    if (distance > POSITION_EPSILON) {
+      direction = { x: dx / distance, y: dy / distance }
+    }
+    return { direction, penetration }
+  }
   const halfWidth = obstacle.width / 2
   const halfHeight = obstacle.height / 2
   const closestX = clampValue(
@@ -790,6 +841,16 @@ const getPointOutlineClearance = (
     const start = outline[index]
     const end = outline[(index + 1) % outline.length]
     if (!start || !end) continue
+    // A separated coordinate interval is a lower bound on Euclidean distance.
+    // Keep the tolerance band so pruning cannot change boundary decisions.
+    const searchDistance = minDistance + COORDINATE_EPSILON
+    if (
+      Math.min(start.x, end.x) - point.x > searchDistance ||
+      point.x - Math.max(start.x, end.x) > searchDistance ||
+      Math.min(start.y, end.y) - point.y > searchDistance ||
+      point.y - Math.max(start.y, end.y) > searchDistance
+    )
+      continue
     minDistance = Math.min(
       minDistance,
       pointToSegmentDistance(point, start, end),
@@ -906,7 +967,10 @@ const pointIsInsideBoard = (srj: SimpleRouteJson, point: Point) =>
     ? pointIsInsideOutline(point, srj.outline)
     : pointIsInsideBounds(point, srj.bounds)
 
-const getPointBoardClearance = (srj: SimpleRouteJson, point: Point) => {
+export const getPointBoardClearance = (
+  srj: SimpleRouteJson,
+  point: Point,
+): number => {
   if (srj.outline && srj.outline.length >= 3) {
     const clearance = getPointOutlineClearance(point, srj.outline)
     return pointIsInsideOutline(point, srj.outline) ? clearance : -clearance
@@ -915,11 +979,11 @@ const getPointBoardClearance = (srj: SimpleRouteJson, point: Point) => {
   return getPointBoundsClearance(point, srj.bounds)
 }
 
-const getSegmentBoardClearance = (
+export const getSegmentBoardClearance = (
   srj: SimpleRouteJson,
   start: Point,
   end: Point,
-) => {
+): number => {
   if (
     Math.abs(start.x - end.x) <= COORDINATE_EPSILON &&
     Math.abs(start.y - end.y) <= COORDINATE_EPSILON
@@ -942,10 +1006,22 @@ const getSegmentBoardClearance = (
     }
 
     let minDistance = Number.POSITIVE_INFINITY
+    const minX = Math.min(start.x, end.x)
+    const maxX = Math.max(start.x, end.x)
+    const minY = Math.min(start.y, end.y)
+    const maxY = Math.max(start.y, end.y)
     for (let index = 0; index < srj.outline.length; index += 1) {
       const edgeStart = srj.outline[index]
       const edgeEnd = srj.outline[(index + 1) % srj.outline.length]
       if (!edgeStart || !edgeEnd) continue
+      const searchDistance = minDistance + COORDINATE_EPSILON
+      if (
+        Math.min(edgeStart.x, edgeEnd.x) - maxX > searchDistance ||
+        minX - Math.max(edgeStart.x, edgeEnd.x) > searchDistance ||
+        Math.min(edgeStart.y, edgeEnd.y) - maxY > searchDistance ||
+        minY - Math.max(edgeStart.y, edgeEnd.y) > searchDistance
+      )
+        continue
       minDistance = Math.min(
         minDistance,
         segmentToSegmentMinDistance(start, end, edgeStart, edgeEnd),
@@ -1973,27 +2049,55 @@ const translateVia = (
   return true
 }
 
-const getSameRootViaSite = (
-  routes: MutableRoute[],
-  via: ViaNode,
-  srj: SimpleRouteJson,
-): ViaNode[] => {
-  const currentVias = collectViaNodes(routes, srj)
-  const currentVia = currentVias.find(
-    (candidate) =>
-      candidate.routeIndex === via.routeIndex &&
-      candidate.pointIndexes.some((pointIndex) =>
-        via.pointIndexes.includes(pointIndex),
-      ),
+export const getSameRootViaSite = ({
+  routes,
+  via,
+  srj,
+}: {
+  routes: MutableRoute[]
+  via: ViaNode
+  srj: SimpleRouteJson
+}): ViaNode[] => {
+  if (!Number.isInteger(via.routeIndex)) return []
+  const currentRoute = routes[via.routeIndex]
+  if (!currentRoute || via.routeIndex < 0 || via.routeIndex >= routes.length)
+    return []
+
+  const currentRouteVias = collectViaNodes([currentRoute], srj)
+  const currentVia = currentRouteVias.find((candidate) =>
+    candidate.pointIndexes.some((pointIndex) =>
+      via.pointIndexes.includes(pointIndex),
+    ),
   )
   if (!currentVia) return []
 
-  return currentVias.filter(
-    (candidate) =>
-      candidate.rootConnectionName === currentVia.rootConnectionName &&
-      Math.hypot(candidate.x - currentVia.x, candidate.y - currentVia.y) <=
-        COORDINATE_EPSILON,
-  )
+  const siteVias: ViaNode[] = []
+  for (let routeIndex = 0; routeIndex < routes.length; routeIndex += 1) {
+    const route = routes[routeIndex]
+    if (
+      !route ||
+      getRootConnectionName(route) !== currentVia.rootConnectionName
+    )
+      continue
+
+    // Grouping remains live and route-local. Reuse only the target route's
+    // collection; unrelated roots cannot contribute to the filtered site.
+    const routeVias =
+      routeIndex === via.routeIndex
+        ? currentRouteVias
+        : collectViaNodes([route], srj)
+    for (const candidate of routeVias) {
+      candidate.routeIndex = routeIndex
+      if (
+        candidate.rootConnectionName === currentVia.rootConnectionName &&
+        Math.hypot(candidate.x - currentVia.x, candidate.y - currentVia.y) <=
+          COORDINATE_EPSILON
+      ) {
+        siteVias.push(candidate)
+      }
+    }
+  }
+  return siteVias
 }
 
 const translateSameRootViaSite = (
@@ -2003,7 +2107,7 @@ const translateSameRootViaSite = (
   dy: number,
   srj: SimpleRouteJson,
 ) => {
-  const siteVias = getSameRootViaSite(routes, via, srj)
+  const siteVias = getSameRootViaSite({ routes, via, srj })
   if (
     siteVias.length === 0 ||
     siteVias.some(
@@ -2041,7 +2145,7 @@ const moveVia = (
   srj: SimpleRouteJson,
 ) =>
   via.movable &&
-  getSameRootViaSite(routes, via, srj).length <= 1 &&
+  getSameRootViaSite({ routes, via, srj }).length <= 1 &&
   translateVia(routes, via, dx, dy, srj)
 
 const moveSegmentAwayFromPoint = (
@@ -2363,13 +2467,23 @@ const moveViaAwayFromPoint = (
   )
 }
 
-const getSegmentDistanceCandidates = (left: Segment, right: Segment) => {
+type SegmentContact = {
+  leftT: number
+  rightT: number
+  leftPoint: Point
+  rightPoint: Point
+}
+
+const getClosestSegmentContact = (
+  left: Segment,
+  right: Segment,
+): SegmentContact => {
   const leftStartProjection = pointToSegmentProjection(left.start, right)
   const leftEndProjection = pointToSegmentProjection(left.end, right)
   const rightStartProjection = pointToSegmentProjection(right.start, left)
   const rightEndProjection = pointToSegmentProjection(right.end, left)
 
-  return [
+  const candidates: SegmentContact[] = [
     {
       leftT: 0,
       rightT: leftStartProjection.t,
@@ -2394,17 +2508,24 @@ const getSegmentDistanceCandidates = (left: Segment, right: Segment) => {
       leftPoint: rightEndProjection,
       rightPoint: right.end,
     },
-  ].sort((a, b) => {
-    const aDistance = Math.hypot(
-      a.leftPoint.x - a.rightPoint.x,
-      a.leftPoint.y - a.rightPoint.y,
+  ]
+  let closest = candidates[0]!
+  let closestDistance = Math.hypot(
+    closest.leftPoint.x - closest.rightPoint.x,
+    closest.leftPoint.y - closest.rightPoint.y,
+  )
+  for (let index = 1; index < candidates.length; index += 1) {
+    const candidate = candidates[index]!
+    const distance = Math.hypot(
+      candidate.leftPoint.x - candidate.rightPoint.x,
+      candidate.leftPoint.y - candidate.rightPoint.y,
     )
-    const bDistance = Math.hypot(
-      b.leftPoint.x - b.rightPoint.x,
-      b.leftPoint.y - b.rightPoint.y,
-    )
-    return aDistance - bDistance
-  })
+    if (distance < closestDistance) {
+      closest = candidate
+      closestDistance = distance
+    }
+  }
+  return closest
 }
 
 const moveSegmentByDistribution = (
@@ -2448,10 +2569,13 @@ const pushViaViaPair = (
   connMap?: ConnectivityMap,
   maxMove = BROAD_MAX_MOVE,
   allowSameNet = false,
+  netMatchers?: BroadNetMatchers,
 ) => {
   if (
     !allowSameNet &&
-    sharesNet(left.rootConnectionName, right.rootConnectionName, connMap)
+    (netMatchers
+      ? netMatchers.routesShareNet(left, right)
+      : sharesNet(left.rootConnectionName, right.rootConnectionName, connMap))
   ) {
     return false
   }
@@ -2565,8 +2689,13 @@ const pushViaSegmentPair = (
   maxMove = BROAD_MAX_MOVE,
   moveDivisor = 2,
   translateSharedViaSite = false,
+  netMatchers?: BroadNetMatchers,
 ) => {
-  if (sharesNet(via.rootConnectionName, segment.rootConnectionName, connMap))
+  if (
+    netMatchers
+      ? netMatchers.routesShareNet(via, segment)
+      : sharesNet(via.rootConnectionName, segment.rootConnectionName, connMap)
+  )
     return false
 
   const projection = pointToSegmentProjection(via, segment)
@@ -2626,25 +2755,42 @@ const pushSegmentSegmentPair = (
   right: Segment,
   srj: SimpleRouteJson,
   connMap?: ConnectivityMap,
+  netMatchers?: BroadNetMatchers,
 ) => {
   if (
     left.z !== right.z ||
-    sharesNet(left.rootConnectionName, right.rootConnectionName, connMap)
+    (netMatchers
+      ? netMatchers.routesShareNet(left, right)
+      : sharesNet(left.rootConnectionName, right.rootConnectionName, connMap))
   ) {
     return false
   }
 
-  const [candidate] = getSegmentDistanceCandidates(left, right)
-  if (!candidate) return false
-
-  const separationX = candidate.leftPoint.x - candidate.rightPoint.x
-  const separationY = candidate.leftPoint.y - candidate.rightPoint.y
-  const distance = Math.hypot(separationX, separationY)
   const requiredDistance =
     left.radius +
     right.radius +
     (RELAXED_DRC_OPTIONS.traceClearance ?? 0.1) +
     CLEARANCE_SLACK
+  // Grid cells are deliberately coarse. Read live endpoints, since earlier
+  // pairs in this pass may have moved them, and keep boundary cases on the
+  // existing exact path rather than changing its rounding or tie order.
+  const rejectionDistance = requiredDistance + POSITION_EPSILON
+  if (
+    Math.min(left.start.x, left.end.x) - Math.max(right.start.x, right.end.x) >
+      rejectionDistance ||
+    Math.min(right.start.x, right.end.x) - Math.max(left.start.x, left.end.x) >
+      rejectionDistance ||
+    Math.min(left.start.y, left.end.y) - Math.max(right.start.y, right.end.y) >
+      rejectionDistance ||
+    Math.min(right.start.y, right.end.y) - Math.max(left.start.y, left.end.y) >
+      rejectionDistance
+  )
+    return false
+
+  const candidate = getClosestSegmentContact(left, right)
+  const separationX = candidate.leftPoint.x - candidate.rightPoint.x
+  const separationY = candidate.leftPoint.y - candidate.rightPoint.y
+  const distance = Math.hypot(separationX, separationY)
   const penetration = requiredDistance - distance
   if (penetration <= 0) return false
 
@@ -2748,6 +2894,19 @@ const getSegmentRectRepulsion = (
 ) => {
   const halfWidth = obstacle.width / 2
   const halfHeight = obstacle.height / 2
+  const rejectionDistance = requiredDistance + POSITION_EPSILON
+  if (
+    Math.min(segment.start.x, segment.end.x) - (obstacle.center.x + halfWidth) >
+      rejectionDistance ||
+    obstacle.center.x - halfWidth - Math.max(segment.start.x, segment.end.x) >
+      rejectionDistance ||
+    Math.min(segment.start.y, segment.end.y) -
+      (obstacle.center.y + halfHeight) >
+      rejectionDistance ||
+    obstacle.center.y - halfHeight - Math.max(segment.start.y, segment.end.y) >
+      rejectionDistance
+  )
+    return undefined
   const obstacleCorners = [
     {
       x: obstacle.center.x - halfWidth,
@@ -2835,10 +2994,11 @@ const pushMovablesAwayFromObstacles = (
   routes: MutableRoute[],
   vias: ViaNode[],
   segments: Segment[],
-  viaSpatialIndex: Map<string, number[]>,
-  segmentSpatialIndex: Map<string, number[]>,
+  viaSpatialIndex: SpatialIndex,
+  segmentSpatialIndex: SpatialIndex,
   spatialCellSize: number,
   connMap?: ConnectivityMap,
+  netMatchers?: BroadNetMatchers,
 ) => {
   let changed = false
   const traceObstacleClearance = getTraceToPadEdgeClearance(srj)
@@ -2859,6 +3019,7 @@ const pushMovablesAwayFromObstacles = (
   for (const obstacle of srj.obstacles) {
     if (obstacle.isCopperPour) continue
     const obstacleBounds = getObstacleBounds(obstacle)
+    const sharesObstacleNet = netMatchers?.forObstacle(obstacle)
 
     const nearbyViaIndexes = getSpatialCandidateIndexes(
       viaSpatialIndex,
@@ -2868,7 +3029,12 @@ const pushMovablesAwayFromObstacles = (
     for (const viaIndex of nearbyViaIndexes) {
       const via = vias[viaIndex]
       if (!via) continue
-      if (obstacleSharesNet(via.rootConnectionName, obstacle, connMap)) continue
+      if (
+        sharesObstacleNet
+          ? sharesObstacleNet(via)
+          : obstacleSharesNet(via.rootConnectionName, obstacle, connMap)
+      )
+        continue
       const repulsion = getRectRepulsion(
         via,
         obstacle,
@@ -2895,7 +3061,9 @@ const pushMovablesAwayFromObstacles = (
       const segment = segments[segmentIndex]
       if (!segment) continue
       if (
-        obstacleSharesNet(segment.rootConnectionName, obstacle, connMap) ||
+        (sharesObstacleNet
+          ? sharesObstacleNet(segment)
+          : obstacleSharesNet(segment.rootConnectionName, obstacle, connMap)) ||
         !obstacleAppliesToSegment(obstacle, segment, srj.layerCount)
       ) {
         continue
@@ -2927,6 +3095,7 @@ const applyBroadRepulsionPass = (
   routes: MutableRoute[],
   connMap?: ConnectivityMap,
   allowSameNetViaPairs = false,
+  netMatchers?: BroadNetMatchers,
 ): boolean => {
   let changed = false
   const vias = collectViaNodes(routes, srj)
@@ -2972,6 +3141,7 @@ const applyBroadRepulsionPass = (
           connMap,
           BROAD_MAX_MOVE,
           allowSameNetViaPairs,
+          netMatchers,
         ) || changed
     }
   }
@@ -2988,7 +3158,17 @@ const applyBroadRepulsionPass = (
       const segment = segments[segmentIndex]
       if (!segment) continue
       changed =
-        pushViaSegmentPair(routes, via, segment, srj, connMap) || changed
+        pushViaSegmentPair(
+          routes,
+          via,
+          segment,
+          srj,
+          connMap,
+          BROAD_MAX_MOVE,
+          2,
+          false,
+          netMatchers,
+        ) || changed
     }
   }
 
@@ -3005,7 +3185,14 @@ const applyBroadRepulsionPass = (
       const right = segments[rightIndex]
       if (!right) continue
       changed =
-        pushSegmentSegmentPair(routes, left, right, srj, connMap) || changed
+        pushSegmentSegmentPair(
+          routes,
+          left,
+          right,
+          srj,
+          connMap,
+          netMatchers,
+        ) || changed
     }
   }
 
@@ -3019,6 +3206,7 @@ const applyBroadRepulsionPass = (
       segmentSpatialIndex,
       spatialCellSize,
       connMap,
+      netMatchers,
     ) || changed
   )
 }
@@ -3027,6 +3215,7 @@ const applyBroadViaSegmentCleanupPass = (
   srj: SimpleRouteJson,
   routes: MutableRoute[],
   connMap?: ConnectivityMap,
+  netMatchers?: BroadNetMatchers,
 ): boolean => {
   let changed = false
   const vias = collectViaNodes(routes, srj)
@@ -3064,11 +3253,70 @@ const applyBroadViaSegmentCleanupPass = (
           connMap,
           BROAD_MAX_MOVE,
           1.75,
+          false,
+          netMatchers,
         ) || changed
     }
   }
 
   return changed
+}
+
+/** Extend native speculative attempts without replaying their common passes.
+ * Each returned candidate owns its geometry. A new incumbent starts over. */
+export const createBroadRepulsionCandidateRunner = ({
+  srj,
+  effort,
+  connMap,
+}: {
+  srj: SimpleRouteJson
+  effort: number
+  connMap?: ConnectivityMap
+}): ((
+  routes: HighDensityRoute[],
+  passMultiplier: number,
+) => HighDensityRoute[]) => {
+  let incumbent: HighDensityRoute[] | undefined
+  let mutableRoutes: MutableRoute[] = []
+  let netMatchers: BroadNetMatchers
+  let completedPasses = 0
+  let settled = false
+  let changed = false
+
+  return (routes, passMultiplier) => {
+    const maxPasses = Math.max(
+      2,
+      Math.round(BROAD_FORCE_PASSES * Math.max(1, effort) * passMultiplier),
+    )
+    if (routes !== incumbent || maxPasses < completedPasses) {
+      incumbent = routes
+      mutableRoutes = cloneRoutes(routes)
+      netMatchers = createBroadNetMatchers(
+        mutableRoutes.length,
+        srj.obstacles.length,
+        connMap,
+      )
+      completedPasses = 0
+      settled = false
+      changed = false
+    } else if (changed && !settled && completedPasses < maxPasses) {
+      // materializeRoutes shares point arrays; detach before extending a
+      // rejected proposal so its snapshot and any observers remain unchanged.
+      mutableRoutes = cloneRoutes(mutableRoutes)
+    }
+
+    while (completedPasses < maxPasses && !settled) {
+      completedPasses += 1
+      if (
+        !applyBroadRepulsionPass(srj, mutableRoutes, connMap, true, netMatchers)
+      ) {
+        settled = true
+        break
+      }
+      changed = true
+    }
+    return changed ? materializeRoutes(mutableRoutes) : routes
+  }
 }
 
 export const applyBroadRepulsionForces = (
@@ -3081,6 +3329,11 @@ export const applyBroadRepulsionForces = (
   runFinalViaSegmentCleanup = true,
 ) => {
   const mutableRoutes = cloneRoutes(routes)
+  const netMatchers = createBroadNetMatchers(
+    mutableRoutes.length,
+    srj.obstacles.length,
+    connMap,
+  )
   const maxPasses = Math.max(
     2,
     Math.round(BROAD_FORCE_PASSES * Math.max(1, effort) * passMultiplier),
@@ -3093,13 +3346,14 @@ export const applyBroadRepulsionForces = (
       mutableRoutes,
       connMap,
       allowSameNetViaPairs,
+      netMatchers,
     )
     if (!passChanged) break
     changed = true
   }
 
   if (changed && runFinalViaSegmentCleanup) {
-    applyBroadViaSegmentCleanupPass(srj, mutableRoutes, connMap)
+    applyBroadViaSegmentCleanupPass(srj, mutableRoutes, connMap, netMatchers)
   }
 
   return changed ? materializeRoutes(mutableRoutes) : routes
@@ -3172,7 +3426,7 @@ export const getTargetedClearanceSweepErrors = (
     .slice(0, maxErrors)
 }
 
-const isViaDrcError = (error: Record<string, unknown>) =>
+export const isViaDrcError = (error: Record<string, unknown>): boolean =>
   getDrcErrorType(error) === "pcb_via_clearance_error" ||
   Array.isArray(error.pcb_via_ids)
 
@@ -3184,6 +3438,17 @@ export const getViaDrcIssueCount = (
     (error) =>
       isViaDrcError(error) && (includeViaPadErrors || !isViaPadDrcError(error)),
   ).length
+
+export const isForbiddenPadDrillError = (
+  error: Record<string, unknown>,
+): boolean => {
+  return (
+    getDrcErrorType(error) === "pcb_placement_error" &&
+    Array.isArray(error.pcb_via_ids) &&
+    error.pcb_via_ids.length === 1 &&
+    Array.isArray(error.pcb_pad_ids)
+  )
+}
 
 export const isViaPadDrcError = (error: Record<string, unknown>) =>
   getDrcErrorType(error) === "pcb_pad_pad_clearance_error" &&
@@ -3243,10 +3508,177 @@ export const getRepairDrcIssueScore = (snapshot: DrcSnapshot) => {
   return snapshot.legacyIssueScore ?? getDrcIssueScore(legacyErrors)
 }
 
+const getTraceObstaclePairIdentity = (
+  error: Record<string, unknown>,
+  snapshot: DrcSnapshot,
+): string | undefined => {
+  const traceId = error.pcb_trace_id
+  if (typeof traceId !== "string" || traceId.length === 0) return undefined
+  const explicitObstacleId = [
+    error.pcb_pad_id,
+    error.pcb_smtpad_id,
+    error.pcb_plated_hole_id,
+    error.pcb_hole_id,
+    error.pcb_keepout_id,
+    error.pcb_obstacle_id,
+  ].find((id): id is string => typeof id === "string" && id.length > 0)
+  const message = error.worst_contact_message ?? error.message
+  const quotedObstacle =
+    typeof message === "string"
+      ? message.match(
+          /\b(?:pcb_smtpad|pcb_plated_hole|pcb_hole|pcb_keepout)\s+"([^"]+)"/,
+        )?.[1]
+      : undefined
+  // Reference DRC may render IDs as readable names, e.g. pcb_smtpad[#pad_1].
+  const obstacleId =
+    explicitObstacleId ??
+    quotedObstacle?.match(/\[#([^\]]+)\]/)?.[1] ??
+    quotedObstacle
+  if (!obstacleId) return undefined
+  // Compare logical connections, not positional fragment IDs or net aliases.
+  // Splitting/reordering one connection preserves its electrical short to a
+  // pad; another connection on the same net still has a distinct identity.
+  const connectionName = snapshot.traceConnectionNameById?.get(traceId)
+  return JSON.stringify([
+    connectionName === undefined ? "trace" : "connection",
+    connectionName ?? traceId,
+    obstacleId,
+  ])
+}
+
+const getTraceObstacleOverlapErrors = (
+  snapshot: DrcSnapshot,
+): Array<Record<string, unknown>> => {
+  const overlaps: Array<Record<string, unknown>> = []
+  // Custom evaluators may omit contacts from the force-targeting list or
+  // enrich only that list. Check both without changing repair targeting.
+  const errors = snapshot.rawErrors
+    ? snapshot.rawErrors.concat(snapshot.errors)
+    : snapshot.errors
+  for (const error of errors) {
+    // Structured trace/obstacle IDs identify contacts even when an external
+    // evaluator's message contains no trace or obstacle words.
+    const pairIdentity = getTraceObstaclePairIdentity(error, snapshot)
+    if (!pairIdentity && !isTraceObstacleDrcError(error)) continue
+    // A pair can have a safe first contact and an overlapping later segment.
+    // Standard snapshots restore the first contact for force targeting, so
+    // acceptance must explicitly inspect the worst contact instead.
+    const clearance = error.worst_actual_clearance ?? error.actual_clearance
+    const message = error.worst_contact_message ?? error.message
+    const overlapsCopper =
+      typeof clearance === "number" && Number.isFinite(clearance)
+        ? clearance < -COORDINATE_EPSILON
+        : typeof message === "string" &&
+          message.includes("(accidental contact)")
+    if (!overlapsCopper) continue
+    overlaps.push(error)
+  }
+  return overlaps
+}
+
+const getTraceObstacleOverlapIds = (
+  snapshot: DrcSnapshot,
+): Set<string | symbol> =>
+  new Set(
+    getTraceObstacleOverlapErrors(snapshot).map(
+      (error) =>
+        getTraceObstaclePairIdentity(error, snapshot) ??
+        Symbol("unidentified trace-obstacle contact"),
+    ),
+  )
+
+export const getNewTraceObstacleOverlapConnectionNames = (
+  candidateSnapshot: DrcSnapshot,
+  inputSnapshot: DrcSnapshot,
+): Set<HighDensityRoute["connectionName"]> | undefined => {
+  const inputOverlaps = getTraceObstacleOverlapIds(inputSnapshot)
+  const connectionNames = new Set<HighDensityRoute["connectionName"]>()
+  for (const error of getTraceObstacleOverlapErrors(candidateSnapshot)) {
+    const pairIdentity = getTraceObstaclePairIdentity(error, candidateSnapshot)
+    // Unknown contacts still require the complete checkpoint. Do not guess
+    // a route from an opaque error ID or a positional trace-name suffix.
+    if (!pairIdentity) return undefined
+    if (inputOverlaps.has(pairIdentity)) continue
+    const traceId = error.pcb_trace_id
+    const connectionName =
+      typeof traceId === "string"
+        ? candidateSnapshot.traceConnectionNameById?.get(traceId)
+        : undefined
+    if (connectionName === undefined) return undefined
+    connectionNames.add(connectionName)
+  }
+  return connectionNames
+}
+
+export const hasNewTraceObstacleOverlaps = (
+  candidateSnapshot: DrcSnapshot,
+  bestSnapshot: DrcSnapshot,
+): boolean => {
+  const candidateOverlaps = getTraceObstacleOverlapIds(candidateSnapshot)
+  if (candidateOverlaps.size === 0) return false
+  const bestOverlaps = getTraceObstacleOverlapIds(bestSnapshot)
+  return [...candidateOverlaps].some((id) => !bestOverlaps.has(id))
+}
+
+/** Cheap native-engine rejection; accepted proposals still receive full DRC. */
+export const hasNewRouteObstacleOverlaps = ({
+  srj,
+  routes,
+  referenceRoutes,
+  referenceSnapshot,
+  inputSnapshot,
+  engine,
+}: {
+  srj: SimpleRouteJson
+  routes: HighDensityRoute[]
+  referenceRoutes: HighDensityRoute[]
+  referenceSnapshot: DrcSnapshot
+  inputSnapshot: DrcSnapshot
+  engine: AutoroutingDrcEngine
+}): boolean => {
+  const relevantNames =
+    getNewTraceObstacleOverlapConnectionNames(
+      referenceSnapshot,
+      inputSnapshot,
+    ) ?? new Set<string>()
+  // Local proposals retain unchanged route objects. A missed name only skips
+  // this rejection shortcut: every remaining proposal still receives full DRC.
+  for (let index = 0; index < routes.length; index++) {
+    if (routes[index] !== referenceRoutes[index])
+      relevantNames.add(routes[index]!.connectionName)
+  }
+  const { traces, traceRouteIndexById, traceConnectionNameById } =
+    createSimplifiedTraces(srj, routes)
+  const traceIds = new Set<string>()
+  for (const [id, name] of traceConnectionNameById) {
+    if (relevantNames.has(name)) traceIds.add(id)
+  }
+  // Keep the full trace order for via ownership/deduplication; the engine builds
+  // and checks obstacle-query geometry only for the selected trace owners.
+  const errors = engine.getObstacleContactErrors(traces, traceIds)
+  return hasNewTraceObstacleOverlaps(
+    {
+      errors,
+      count: errors.length,
+      issueScore: getDrcIssueScore(errors),
+      traceRouteIndexById,
+      traceConnectionNameById,
+    },
+    inputSnapshot,
+  )
+}
+
 export const isDrcSnapshotCountBetter = (
   candidateSnapshot: DrcSnapshot,
   bestSnapshot: DrcSnapshot,
 ) => {
+  const candidateDrillCount = candidateSnapshot.errors.filter(
+    isForbiddenPadDrillError,
+  ).length
+  const bestDrillCount = bestSnapshot.errors.filter(
+    isForbiddenPadDrillError,
+  ).length
+  if (candidateDrillCount > bestDrillCount) return false
   const candidateLegacyCount = getNonViaPadDrcIssueCount(candidateSnapshot)
   const bestLegacyCount = getNonViaPadDrcIssueCount(bestSnapshot)
   if (candidateLegacyCount !== bestLegacyCount) {
@@ -3257,12 +3689,14 @@ export const isDrcSnapshotCountBetter = (
 }
 
 /**
- * Repair established DRC types before via-to-pad errors. Detection remains
- * complete; this ordering only controls how the bounded repair budget is used.
+ * Repair forbidden pad drills first, then established copper DRC types before
+ * via-to-pad clearance. Detection remains complete throughout the search.
  */
 export const getLegacyFirstRepairErrors = (
   errors: Array<Record<string, unknown>>,
 ) => {
+  const drillErrors = errors.filter(isForbiddenPadDrillError)
+  if (drillErrors.length > 0) return drillErrors
   const legacyErrors = errors.filter((error) => !isViaPadDrcError(error))
   return legacyErrors.length > 0 ? legacyErrors : errors
 }
@@ -3401,15 +3835,19 @@ const rotateDirection = (direction: Point, eighthTurns: number) => {
   }
 }
 
-const getExternalViaPoint = (
-  endpoint: Point,
-  pad: SimpleRouteJson["obstacles"][number],
-  direction: Point,
-  viaRadius: number,
-) => {
+const getExternalViaPoint = ({
+  endpoint,
+  pad,
+  direction,
+  requiredDistance,
+}: {
+  endpoint: Point
+  pad: SimpleRouteJson["obstacles"][number]
+  direction: Point
+  requiredDistance: number
+}): Point | undefined => {
   let insideDistance = 0
-  let outsideDistance = Math.hypot(pad.width, pad.height) + viaRadius * 2
-  const requiredDistance = viaRadius + POSITION_EPSILON
+  let outsideDistance = Math.hypot(pad.width, pad.height) + requiredDistance * 2
   const pointAtDistance = (distance: number) => ({
     x: endpoint.x + direction.x * distance,
     y: endpoint.y + direction.y * distance,
@@ -3450,9 +3888,11 @@ const appendDistinctRoutePoint = (
   point: MutableRoute["route"][number],
 ) => {
   const previous = points.at(-1)
+  // A nearby wire vertex cannot replace the exact anchor of a via.
   if (
     previous &&
-    areSameXY(previous, point) &&
+    previous.x === point.x &&
+    previous.y === point.y &&
     previous.z === point.z &&
     previous.pcb_port_id === point.pcb_port_id
   ) {
@@ -3553,16 +3993,19 @@ export const applySafeTraceLayerMoveForError = (
     if (!pad || !tangent) return undefined
     const rotation =
       endpointSide === "start" ? rotationPair[0] : rotationPair[1]
-    const escape = getExternalViaPoint(
+    const requiredDistance =
+      viaRadius + getViaEdgeToPadEdgeClearance(srj) + POSITION_EPSILON
+    const escape = getExternalViaPoint({
       endpoint,
       pad,
-      rotateDirection(tangent, rotation),
-      viaRadius,
-    )
+      direction: rotateDirection(tangent, rotation),
+      requiredDistance,
+    })
     if (
       !escape ||
       !isViaInsideBounds(escape, viaRadius, srj.bounds) ||
-      getPointToObstacleDistance(escape, pad) + POSITION_EPSILON < viaRadius
+      getPointToObstacleDistance(escape, pad) + POSITION_EPSILON <
+        requiredDistance
     ) {
       return undefined
     }
@@ -3597,13 +4040,14 @@ export const applySafeTraceLayerMoveForError = (
   }
 
   const spanStart = originalPoints[spanStartIndex]!
+  const precedingSpanPoint = originalPoints[spanStartIndex - 1]
   const startsAtExistingTransition =
-    spanStartIndex > 0 &&
-    areSameXY(originalPoints[spanStartIndex - 1]!, spanStart)
+    precedingSpanPoint?.x === spanStart.x &&
+    precedingSpanPoint.y === spanStart.y
   const spanEnd = originalPoints[spanEndIndex]!
+  const followingSpanPoint = originalPoints[spanEndIndex + 1]
   const endsAtExistingTransition =
-    spanEndIndex < originalPoints.length - 1 &&
-    areSameXY(originalPoints[spanEndIndex + 1]!, spanEnd)
+    followingSpanPoint?.x === spanEnd.x && followingSpanPoint.y === spanEnd.y
 
   if (movesStartTerminal) {
     appendDistinctRoutePoint(movedRoute, first)
@@ -3996,8 +4440,7 @@ export const applyTracePairSegmentDisplacementForError = (
     return undefined
   }
 
-  const [contact] = getSegmentDistanceCandidates(leftSegment, rightSegment)
-  if (!contact) return undefined
+  const contact = getClosestSegmentContact(leftSegment, rightSegment)
   const separationX = contact.leftPoint.x - contact.rightPoint.x
   const separationY = contact.leftPoint.y - contact.rightPoint.y
   const distance = Math.hypot(separationX, separationY)
@@ -4734,6 +5177,13 @@ export const isBetterDrcSnapshot = (
   bestSnapshot?: DrcSnapshot,
 ) => {
   if (bestSnapshot) {
+    const candidateDrillCount = candidateSnapshot.errors.filter(
+      isForbiddenPadDrillError,
+    ).length
+    const bestDrillCount = bestSnapshot.errors.filter(
+      isForbiddenPadDrillError,
+    ).length
+    if (candidateDrillCount > bestDrillCount) return false
     const candidateLegacyCount = getNonViaPadDrcIssueCount(candidateSnapshot)
     const bestLegacyCount = getNonViaPadDrcIssueCount(bestSnapshot)
     if (candidateLegacyCount !== bestLegacyCount) {
@@ -4749,6 +5199,7 @@ export const isBetterDrcSnapshot = (
     (candidateIssueCount === bestIssueCount &&
       candidateIssueScore < bestIssueScore) ||
     (candidateIssueCount === bestIssueCount &&
+      candidateIssueScore === bestIssueScore &&
       candidateViaIssueCount < bestViaIssueCount)
   )
 }
@@ -4766,11 +5217,10 @@ export const applyDrcErrorForces = (
   enableTraceViaOwnerTargeting = false,
 ) => {
   let changed = false
+  let vias = collectViaNodes(routes, srj)
+  let segments = collectSegments(routes)
 
   for (const error of errors) {
-    // Earlier errors can insert detour points, invalidating cached indices.
-    const vias = collectViaNodes(routes, srj)
-    const segments = collectSegments(routes)
     const center = getErrorCenter(error)
     if (!center) continue
     let repulsionPoint = center
@@ -4782,6 +5232,7 @@ export const applyDrcErrorForces = (
     const hasTraceViaMetadata =
       !isViaPairError &&
       !isViaPadError &&
+      !Array.isArray(error.pcb_pad_ids) &&
       hasReportedViaIds &&
       (typeof error.pcb_trace_id === "string" ||
         Array.isArray(error.pcb_trace_ids))
@@ -4824,9 +5275,36 @@ export const applyDrcErrorForces = (
       } else {
         const nearestVia = getNearestVia(vias, center, targetRouteIndex)
         if (nearestVia) {
-          changed =
-            moveViaAwayFromPoint(routes, nearestVia, repulsionPoint, srj) ||
-            changed
+          if (
+            isForbiddenPadDrillError(error) &&
+            typeof error.minimum_clearance === "number" &&
+            typeof error.actual_clearance === "number"
+          ) {
+            const dx = nearestVia.x - repulsionPoint.x
+            const dy = nearestVia.y - repulsionPoint.y
+            const distance = Math.hypot(dx, dy)
+            const move =
+              Math.min(
+                MAX_ERROR_MOVE,
+                error.minimum_clearance -
+                  error.actual_clearance +
+                  POSITION_EPSILON,
+              ) * scale
+            const directionX = distance > POSITION_EPSILON ? dx / distance : 1
+            const directionY = distance > POSITION_EPSILON ? dy / distance : 0
+            changed =
+              moveVia(
+                routes,
+                nearestVia,
+                directionX * move,
+                directionY * move,
+                srj,
+              ) || changed
+          } else {
+            changed =
+              moveViaAwayFromPoint(routes, nearestVia, repulsionPoint, srj) ||
+              changed
+          }
         }
       }
       continue
@@ -4963,6 +5441,8 @@ export const applyDrcErrorForces = (
               nearestSegment,
               srj.layerCount,
             )))
+      const pointCountBeforeMove =
+        routes[nearestSegment.routeIndex]!.route.length
       const movedSegment = shouldUseObstacleMove
         ? moveSegmentAwayFromObstacle(
             routes,
@@ -4979,14 +5459,20 @@ export const applyDrcErrorForces = (
             srj,
             scale,
           )
+      // Detours insert vertices, shifting cached via and segment point indices.
+      // Refresh before this error's remaining via force or the next error.
+      if (
+        routes[nearestSegment.routeIndex]!.route.length !== pointCountBeforeMove
+      ) {
+        vias = collectViaNodes(routes, srj)
+        segments = collectSegments(routes)
+      }
       changed = movedSegment || changed
     }
 
-    // Segment repair above can splice this very route. Resolve the current
-    // via points so both ends of its layer transition move together.
     const nearestVia = hasTargetedTraceViaMetadata
       ? undefined
-      : getNearestVia(collectViaNodes(routes, srj), center)
+      : getNearestVia(vias, center)
     if (
       nearestVia &&
       Math.hypot(nearestVia.x - center.x, nearestVia.y - center.y) < 0.35

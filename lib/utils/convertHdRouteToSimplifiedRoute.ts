@@ -7,6 +7,7 @@ type RoutePoint = {
   y: number
   z: number
   pcb_port_id?: string
+  toNextSegmentType?: "through_obstacle"
 }
 
 type SimplifiedRouteSegment = SimplifiedPcbTrace["route"][number]
@@ -70,6 +71,7 @@ export const convertHdRouteToSimplifiedRoute = (
     if (!previousPoint || !currentPoint) continue
 
     if (
+      previousPoint.toNextSegmentType !== "through_obstacle" &&
       previousPoint.z !== currentPoint.z &&
       previousPoint.x === currentPoint.x &&
       previousPoint.y === currentPoint.y
@@ -82,6 +84,7 @@ export const convertHdRouteToSimplifiedRoute = (
         to_layer: mapZToLayerName(currentPoint.z, layerCount),
         ...(options?.viaDiameter ? { via_diameter: options.viaDiameter } : {}),
       })
+      continue
     }
 
     simplifiedRoute.push({

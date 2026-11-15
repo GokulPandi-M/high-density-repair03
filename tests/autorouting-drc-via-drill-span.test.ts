@@ -38,16 +38,21 @@ test("uses Core's through-via geometry unless blind and buried vias are enabled"
     },
   ]
 
-  for (const allowBlindAndBuriedVias of [undefined, false]) {
+  const engine = new AutoroutingDrcEngine(srj)
+  for (const allowBlindAndBuriedVias of [undefined, false, true, false]) {
     srj.allowBlindAndBuriedVias = allowBlindAndBuriedVias
-    expect(new AutoroutingDrcEngine(srj).evaluate(traces).errors).toHaveLength(
-      1,
+    expect(engine.evaluate(traces).errors).toHaveLength(
+      allowBlindAndBuriedVias ? 0 : 1,
     )
     expect(
       convertToCircuitJson(srj, traces).find(
         (element) => element.type === "pcb_via",
       ),
-    ).toMatchObject({ layers: ["top", "inner1", "inner2", "bottom"] })
+    ).toMatchObject({
+      layers: allowBlindAndBuriedVias
+        ? ["top", "inner1", "inner2"]
+        : ["top", "inner1", "inner2", "bottom"],
+    })
   }
 
   srj.allowBlindAndBuriedVias = true
