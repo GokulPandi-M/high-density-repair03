@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test"
 import { getViaLayers } from "../lib/utils/getViaLayers"
 
-test("expands via endpoints across the complete inclusive layer span", () => {
+test("normalizes both via APIs across the complete inclusive layer span", () => {
   const layers = ["top", "inner1", "inner2", "bottom"]
+  expect(getViaLayers({ layers }, 4)).toBe(layers)
   expect(getViaLayers({ from_layer: "top", to_layer: "bottom" }, 4)).toEqual(
     layers,
   )

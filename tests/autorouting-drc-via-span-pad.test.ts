@@ -5,6 +5,7 @@ import type { SimpleRouteJson, SimplifiedPcbTraces } from "../lib/types"
 test("checks via-to-pad clearance on intermediate layers only within the span", () => {
   const srj: SimpleRouteJson = {
     layerCount: 4,
+    allowBlindAndBuriedVias: true,
     minTraceWidth: 0.1,
     minViaDiameter: 0.3,
     bounds: { minX: -2, minY: -2, maxX: 2, maxY: 2 },
@@ -44,8 +45,7 @@ test("checks via-to-pad clearance on intermediate layers only within the span", 
 
   const via = traces[0]!.route[0]!
   if (via.route_type !== "via") throw new Error("Expected a via")
-  via.from_layer = "inner2"
-  via.to_layer = "top"
+  via.layers = ["top", "inner1", "inner2"]
   expect(new AutoroutingDrcEngine(srj).evaluate(traces).errors).toEqual(errors)
   srj.obstacles[0]!.layers = ["bottom"]
   expect(new AutoroutingDrcEngine(srj).evaluate(traces).errors).toEqual([])

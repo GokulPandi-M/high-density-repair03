@@ -1,0 +1,610 @@
+import { BaseSolver } from "../BaseSolver"
+import type { HighDensityRoute } from "../../types/high-density-types"
+import { GlobalDrcBranchPortfolioSolver } from "./GlobalDrcBranchPortfolioSolver"
+import { TraceContactGuard } from "./TraceContactGuard"
+import { getPeerTraceRepairCandidates } from "./getPeerTraceRepairCandidates"
+import { getPeerTraceViaCandidates } from "./getPeerTraceViaCandidates"
+import { haveSameForceCandidateGeometry } from "./haveSameForceCandidateGeometry"
+import { getDrcInvolvedRouteIndexes } from "./getDrcInvolvedRouteIndexes"
+import { getTraceViaSimplificationCandidates } from "./getTraceViaSimplificationCandidates"
+import {
+  applyDrcErrorForces,
+  cloneRoutes,
+  getDrcSnapshot,
+  hasNewTraceObstacleOverlaps,
+  isForbiddenPadDrillError,
+  isViaDrcError,
+  materializeRoutesForIndexes,
+} from "./solverHelpers"
+import { restoreOverlappingConnections } from "./restoreOverlappingConnections"
+import type { DrcSnapshot, GlobalDrcBranchPortfolioSolverParams } from "./types"
+
+export type TraceContactRepairSolverParams =
+  GlobalDrcBranchPortfolioSolverParams & {
+    /** Copper before any intermediate stages were allowed to defer their guard. */
+    inputHdRoutes: HighDensityRoute[]
+  }
+type Candidate = { routes: HighDensityRoute[]; snapshot: DrcSnapshot }
+type Phase = "start" | "contacts" | "refine" | "vias" | "simplify" | "done"
+
+// Bound geometric search and expensive DRC evaluations.
+const MAX_GEOMETRY_CHECKS = 4096
+const MAX_CANDIDATE_CHECKS = 768
+// Contact search leaves part of the DRC budget for later refinement.
+const MAX_CONTACT_CANDIDATE_CHECKS = 256
+
+const countVias = (routes: HighDensityRoute[]): number =>
+  routes.reduce((count, route) => count + route.vias.length, 0)
+const isBetter = (candidate: Candidate, previous: Candidate): boolean =>
+  candidate.snapshot.count < previous.snapshot.count ||
+  (candidate.snapshot.count === previous.snapshot.count &&
+    candidate.snapshot.issueScore < previous.snapshot.issueScore - 1e-8)
+
+/** Bounded local repair for a pipeline's final physical trace contacts. */
+export class TraceContactRepairSolver extends BaseSolver {
+  readonly params: TraceContactRepairSolverParams
+  readonly guard: TraceContactGuard
+  private readonly inputContactGuard: TraceContactGuard
+  private phase: Phase = "start"
+  private inputSnapshot?: DrcSnapshot
+  private targetDrcCount = Infinity
+  private current?: Candidate
+  private best?: Candidate
+  private proposals?: Generator<HighDensityRoute[]>
+  private candidateContactCheck?: ReturnType<
+    TraceContactGuard["prepareCandidateCheck"]
+  >
+  private pairs: (readonly [string, string])[] = []
+  private affectedConnections = new Set<string>()
+  private refineSolver?: GlobalDrcBranchPortfolioSolver
+  private refinementRounds = 0
+  private allowRefinementContacts = false
+  private fineViaAdjustment = false
+  private refinementCheckpoint?: Candidate
+  private candidateChecks = 0
+  private geometryChecks = 0
+  private contactRounds = 0
+  private expandedBridgeSearch = false
+  private viaRounds = 0
+  private viaRefinementRouteIndexes?: ReadonlySet<number>
+  private simplificationRounds = 0
+  private outputHdRoutes: HighDensityRoute[]
+
+  constructor(params: TraceContactRepairSolverParams) {
+    super()
+    this.params = params
+    this.guard = new TraceContactGuard({
+      srj: params.srj,
+      inputRoutes: params.inputHdRoutes,
+      connMap: params.connMap,
+    })
+    this.inputContactGuard = new TraceContactGuard({
+      srj: params.srj,
+      inputRoutes: params.inputHdRoutes,
+      connMap: params.connMap,
+    })
+    this.outputHdRoutes = params.inputHdRoutes
+    this.MAX_ITERATIONS = 20000
+  }
+
+  private snapshot(routes: HighDensityRoute[]): DrcSnapshot {
+    return getDrcSnapshot(
+      this.params.srj,
+      routes,
+      this.params.drcEvaluator,
+      this.params.connMap,
+      this.params.autoroutingDrcEngine,
+    )
+  }
+
+  private startContactRound(): void {
+    this.guard.preserveClearedContacts(this.current!.routes)
+    this.pairs = this.guard.getNewContactPairs(this.current!.routes)
+    // Resolve wire crossings before choosing how to move adjacent annuli.
+    const wirePairs = new Set(
+      this.guard
+        .getNewWireContactPairs(this.current!.routes)
+        .map((pair) => JSON.stringify(pair)),
+    )
+    this.pairs.sort(
+      (left, right) =>
+        Number(wirePairs.has(JSON.stringify(right))) -
+        Number(wirePairs.has(JSON.stringify(left))),
+    )
+    if (this.pairs.length === 0) {
+      this.startRefinement()
+      return
+    }
+    if (
+      this.contactRounds++ >= 8 ||
+      this.geometryChecks >= MAX_GEOMETRY_CHECKS ||
+      this.candidateChecks >= MAX_CONTACT_CANDIDATE_CHECKS
+    ) {
+      this.finish()
+      return
+    }
+    this.best = undefined
+    this.expandedBridgeSearch = false
+    this.candidateContactCheck = this.guard.prepareCandidateCheck(
+      this.current!.routes,
+    )
+    this.proposals = getPeerTraceRepairCandidates({
+      ...this.params,
+      routes: this.current!.routes,
+      pair: this.pairs[0]!,
+    })
+    this.phase = "contacts"
+  }
+
+  private startRefinement(): void {
+    if (
+      this.allowRefinementContacts &&
+      this.current!.snapshot.count <= this.targetDrcCount &&
+      this.viaRounds === 0 &&
+      !hasNewTraceObstacleOverlaps(this.current!.snapshot, this.inputSnapshot!)
+    ) {
+      // Removing a refinement's annulus contact can leave a small clearance
+      // error. Give the repaired stacks one fine pass, stopping at improvement.
+      this.fineViaAdjustment = true
+      this.startViaRound()
+      return
+    }
+    if (
+      this.current!.snapshot.count <= this.targetDrcCount ||
+      hasNewTraceObstacleOverlaps(this.current!.snapshot, this.inputSnapshot!)
+    ) {
+      this.finish()
+      return
+    }
+    if (this.refinementRounds++ >= 2) {
+      this.startViaRound()
+      return
+    }
+    if (
+      !this.refinementCheckpoint ||
+      isBetter(this.current!, this.refinementCheckpoint)
+    )
+      this.refinementCheckpoint = this.current
+    this.refineSolver = new GlobalDrcBranchPortfolioSolver({
+      ...this.params,
+      hdRoutes: this.current!.routes,
+      maxIterations: 1,
+      viaInPadMaxIterations: Math.min(
+        24,
+        this.params.viaInPadMaxIterations ?? 8,
+      ),
+      broadMaxIterations: 4,
+      // Refine the selected bridges without another topology search that can
+      // recreate a crossing.
+      enableSafeTraceLayerMoves: false,
+      prioritizeMultipleTraceContactRepair: false,
+      enableBroadFallback: false,
+      enableLargeBoardBroadFallback: false,
+      enablePostSolveClearanceRelaxation: false,
+      // This solver owns the final contact check. Keep a useful refinement
+      // available for local contact repair instead of discarding it wholesale.
+      deferTraceContactGuard: this.allowRefinementContacts,
+      referenceDrcEvaluator: undefined,
+    })
+    this.activeSubSolver = this.refineSolver
+    this.phase = "refine"
+  }
+
+  private startViaRound(): void {
+    this.guard.preserveClearedContacts(this.current!.routes)
+    if (
+      // Annulus repairs can move existing stacks as well as create bridges.
+      // Continue improving both within the shared candidate/geometry budgets.
+      this.current!.snapshot.count === 0 ||
+      this.viaRounds++ >= 8 ||
+      this.candidateChecks >= MAX_CANDIDATE_CHECKS
+    ) {
+      this.finish()
+      return
+    }
+    this.best = this.current
+    this.viaRefinementRouteIndexes = getDrcInvolvedRouteIndexes(
+      this.current!.snapshot,
+    )
+    this.candidateContactCheck = this.guard.prepareCandidateCheck(
+      this.current!.routes,
+    )
+    this.proposals = getPeerTraceViaCandidates({
+      srj: this.params.srj,
+      routes: this.current!.routes,
+      previousRoutes: this.params.hdRoutes,
+      affectedConnections: this.affectedConnections,
+      fineAdjustmentOnly: this.fineViaAdjustment,
+    })
+    this.phase = "vias"
+  }
+
+  private repairRestoredVias(
+    candidate: Candidate,
+    restoredConnectionNames: ReadonlySet<HighDensityRoute["connectionName"]>,
+  ): Candidate {
+    const guard = new TraceContactGuard({
+      srj: this.params.srj,
+      inputRoutes: candidate.routes,
+      connMap: this.params.connMap,
+    })
+    // Restoring one connection can invalidate another route's via clearance.
+    // Recheck the boundary between restored and retained copper.
+    const viaErrors = candidate.snapshot.errors.filter((error): boolean => {
+      if (isForbiddenPadDrillError(error)) return true
+      if (!isViaDrcError(error) || !Array.isArray(error.pcb_trace_ids))
+        return false
+      let hasRestoredOwner = false
+      let hasRetainedOwner = false
+      for (const id of error.pcb_trace_ids) {
+        const owner = candidate.snapshot.traceConnectionNameById?.get(id)
+        if (owner === undefined) continue
+        if (restoredConnectionNames.has(owner)) hasRestoredOwner = true
+        else hasRetainedOwner = true
+      }
+      return hasRestoredOwner && hasRetainedOwner
+    })
+    viaErrors.sort(
+      (left, right): number =>
+        Number(isForbiddenPadDrillError(right)) -
+        Number(isForbiddenPadDrillError(left)),
+    )
+    const finalizationBudget = Math.max(
+      0,
+      MAX_CANDIDATE_CHECKS - this.candidateChecks,
+    )
+    for (const error of viaErrors.slice(0, finalizationBudget)) {
+      // Search may have used its geometry budget; final validation still shares
+      // the DRC budget and makes at most one proposal per reported via issue.
+      if (this.candidateChecks >= MAX_CANDIDATE_CHECKS) break
+      // Forces can move nearby copper outside the error's named owners.
+      // Rejected proposals must not mutate the candidate we retain.
+      const routes = cloneRoutes(candidate.routes)
+      if (
+        !applyDrcErrorForces(
+          this.params.srj,
+          routes,
+          [error],
+          candidate.snapshot.traceRouteIndexById,
+          1,
+          this.params.connMap,
+        )
+      )
+        continue
+      const changedRouteIndexes: number[] = []
+      for (let index = 0; index < routes.length; index++) {
+        if (
+          !haveSameForceCandidateGeometry(
+            [routes[index]!],
+            [candidate.routes[index]!],
+          )
+        )
+          changedRouteIndexes.push(index)
+      }
+      const repairedRoutes = materializeRoutesForIndexes(
+        routes,
+        changedRouteIndexes,
+      )
+      this.geometryChecks++
+      if (guard.getNewContactPairs(repairedRoutes).length > 0) continue
+      this.candidateChecks++
+      const proposal = {
+        routes: repairedRoutes,
+        snapshot: this.snapshot(repairedRoutes),
+      }
+      if (
+        isBetter(proposal, candidate) &&
+        !hasNewTraceObstacleOverlaps(proposal.snapshot, this.inputSnapshot!) &&
+        !hasNewTraceObstacleOverlaps(proposal.snapshot, candidate.snapshot)
+      )
+        candidate = proposal
+    }
+    return candidate
+  }
+
+  private finish(): void {
+    let candidate = this.current
+    const repairedCandidate = candidate
+    const restoredConnectionNames = new Set<
+      HighDensityRoute["connectionName"]
+    >()
+    // Whole-connection restoration uses the input baseline. The local guard
+    // also forbids cleared input contacts, which can reject the checkpoint.
+    const publicationGuard = this.inputContactGuard
+    // A deferred via contact may have no legal local proposal. Restore its
+    // whole connections, then validate the mixed board before publishing it.
+    // Preserve independent repairs rather than reverting every connection.
+    for (let attempt = 0; candidate && attempt < 2; attempt++) {
+      const peerConnectionNames = publicationGuard.getNewContactConnectionNames(
+        candidate.routes,
+      )
+      if (peerConnectionNames.size === 0) break
+      const restored = restoreOverlappingConnections({
+        routes: candidate.routes,
+        snapshot: candidate.snapshot,
+        inputSnapshot: this.inputSnapshot!,
+        checkpointRoutes: this.params.inputHdRoutes,
+        peerConnectionNames,
+      })
+      if (!restored) break
+      for (const name of restored.restoredConnectionNames)
+        restoredConnectionNames.add(name)
+      this.candidateChecks++
+      candidate = {
+        routes: restored.routes,
+        snapshot: this.snapshot(restored.routes),
+      }
+    }
+    // Restoring one side can make its peer's repaired route safe again.
+    if (candidate && repairedCandidate) {
+      for (const name of restoredConnectionNames) {
+        if (
+          this.candidateChecks >= MAX_CANDIDATE_CHECKS ||
+          this.geometryChecks >= MAX_GEOMETRY_CHECKS
+        )
+          break
+        const retained = restoreOverlappingConnections({
+          routes: candidate.routes,
+          snapshot: candidate.snapshot,
+          inputSnapshot: this.inputSnapshot!,
+          checkpointRoutes: repairedCandidate.routes,
+          peerConnectionNames: new Set([name]),
+        })
+        if (!retained) continue
+        this.geometryChecks++
+        if (publicationGuard.getNewContactPairs(retained.routes).length > 0)
+          continue
+        this.candidateChecks++
+        const proposal = {
+          routes: retained.routes,
+          snapshot: this.snapshot(retained.routes),
+        }
+        if (
+          isBetter(proposal, candidate) &&
+          !hasNewTraceObstacleOverlaps(proposal.snapshot, this.inputSnapshot!)
+        )
+          candidate = proposal
+      }
+    }
+    const checkpoint = this.refinementCheckpoint
+    if (
+      checkpoint &&
+      this.guard.getNewContactPairs(checkpoint.routes).length === 0 &&
+      !hasNewTraceObstacleOverlaps(checkpoint.snapshot, this.inputSnapshot!) &&
+      (!candidate ||
+        isBetter(checkpoint, candidate) ||
+        this.guard.getNewContactPairs(candidate.routes).length > 0 ||
+        hasNewTraceObstacleOverlaps(candidate.snapshot, this.inputSnapshot!))
+    )
+      candidate = checkpoint
+    if (candidate && restoredConnectionNames.size > 0)
+      candidate = this.repairRestoredVias(candidate, restoredConnectionNames)
+    if (
+      candidate &&
+      candidate.snapshot.count <= this.inputSnapshot!.count &&
+      publicationGuard.getNewContactPairs(candidate.routes).length === 0 &&
+      !hasNewTraceObstacleOverlaps(candidate.snapshot, this.inputSnapshot!)
+    ) {
+      if (
+        this.phase !== "simplify" &&
+        countVias(candidate.routes) > countVias(this.params.hdRoutes)
+      ) {
+        this.current = candidate
+        this.startSimplificationRound()
+        return
+      }
+      this.outputHdRoutes = candidate.routes
+    }
+    this.stats = {
+      traceContactRepairCandidateChecks: this.candidateChecks,
+      traceContactRepairGeometryChecks: this.geometryChecks,
+      traceContactRepairContactRounds: this.contactRounds,
+      traceContactRepairViaRounds: this.viaRounds,
+      traceContactRepairSimplificationRounds: this.simplificationRounds,
+      traceContactRepairAccepted:
+        this.outputHdRoutes !== this.params.inputHdRoutes,
+    }
+    this.activeSubSolver = null
+    this.phase = "done"
+    this.progress = 1
+    this.solved = true
+  }
+
+  private startSimplificationRound(): void {
+    this.phase = "simplify"
+    this.guard.preserveClearedContacts(this.current!.routes)
+    if (
+      countVias(this.current!.routes) <= countVias(this.params.hdRoutes) ||
+      this.simplificationRounds++ >= 4
+    ) {
+      this.finish()
+      return
+    }
+    this.proposals = getTraceViaSimplificationCandidates(this.current!.routes)
+    this.candidateContactCheck = this.guard.prepareCandidateCheck(
+      this.current!.routes,
+    )
+  }
+
+  override _step(): void {
+    if (this.phase === "start") {
+      this.inputSnapshot = this.snapshot(this.params.inputHdRoutes)
+      this.current = {
+        routes: this.params.hdRoutes,
+        snapshot: this.snapshot(this.params.hdRoutes),
+      }
+      // Restore the candidate's DRC quality after removing its physical shorts.
+      // A candidate with more errors than the original input still needs repair.
+      this.targetDrcCount = Math.min(
+        this.current.snapshot.count,
+        this.inputSnapshot.count,
+      )
+      this.affectedConnections = this.guard.getNewContactConnectionNames(
+        this.current.routes,
+      )
+      this.startContactRound()
+      return
+    }
+    if (this.phase === "refine") {
+      const solver = this.refineSolver!
+      solver.step()
+      if (solver.failed)
+        throw new Error(`Peer contact refinement failed: ${solver.error}`)
+      if (!solver.solved) return
+      const routes = solver.getOutput()
+      const candidate = { routes, snapshot: this.snapshot(routes) }
+      if (
+        isBetter(candidate, this.current!) &&
+        !hasNewTraceObstacleOverlaps(candidate.snapshot, this.inputSnapshot!)
+      ) {
+        this.current = candidate
+        if (this.guard.getNewContactPairs(routes).length > 0) {
+          this.activeSubSolver = null
+          this.startContactRound()
+          return
+        }
+      }
+      this.activeSubSolver = null
+      if (
+        !this.allowRefinementContacts &&
+        this.current!.snapshot.count > this.targetDrcCount &&
+        solver.stats.drcBranchPortfolioPeerTraceRepairRolledBack
+      ) {
+        this.allowRefinementContacts = true
+        this.startRefinement()
+        return
+      }
+      this.startViaRound()
+      return
+    }
+    if (this.phase === "simplify") {
+      const proposal = this.proposals!.next()
+      if (
+        proposal.done ||
+        this.geometryChecks >= MAX_GEOMETRY_CHECKS ||
+        this.candidateChecks >= MAX_CANDIDATE_CHECKS
+      ) {
+        this.finish()
+        return
+      }
+      const routes = proposal.value
+      this.geometryChecks++
+      if (this.candidateContactCheck!(routes).length > 0) return
+      this.candidateChecks++
+      const snapshot = this.snapshot(routes)
+      if (
+        snapshot.count > this.current!.snapshot.count ||
+        hasNewTraceObstacleOverlaps(snapshot, this.inputSnapshot!) ||
+        countVias(routes) >= countVias(this.current!.routes)
+      )
+        return
+      this.current = { routes, snapshot }
+      this.startSimplificationRound()
+      return
+    }
+    if (this.phase !== "contacts" && this.phase !== "vias") return
+    const proposal = this.proposals!.next()
+    if (
+      proposal.done ||
+      this.geometryChecks >= MAX_GEOMETRY_CHECKS ||
+      this.candidateChecks >= MAX_CANDIDATE_CHECKS
+    ) {
+      if (this.phase === "contacts") {
+        if (!this.best) {
+          if (
+            proposal.done &&
+            !this.expandedBridgeSearch &&
+            this.geometryChecks < MAX_GEOMETRY_CHECKS &&
+            this.candidateChecks < MAX_CONTACT_CANDIDATE_CHECKS
+          ) {
+            // Widen placement only when the standard bridge samples miss a
+            // legal corridor. Both searches share the same work budgets.
+            this.expandedBridgeSearch = true
+            // Narrow bridges need joint annulus refinement; this owner will
+            // repair those contacts before publishing the refined candidate.
+            this.allowRefinementContacts = true
+            this.proposals = getPeerTraceRepairCandidates({
+              ...this.params,
+              routes: this.current!.routes,
+              pair: this.pairs[0]!,
+              includeAnnulusOffsets: true,
+            })
+            return
+          }
+          this.finish()
+          return
+        }
+        this.current = this.best
+        this.startContactRound()
+      } else if (this.best !== this.current) {
+        const countImproved =
+          this.best!.snapshot.count < this.current!.snapshot.count
+        this.current = this.best
+        // Once the original DRC quality is recovered, do not spend more full
+        // board evaluations traversing a plateau solely to polish severity.
+        if (countImproved || this.current!.snapshot.count > this.targetDrcCount)
+          this.startViaRound()
+        else this.finish()
+      } else this.finish()
+      return
+    }
+    const routes = proposal.value
+    if (
+      this.phase === "vias" &&
+      this.viaRefinementRouteIndexes !== undefined &&
+      !routes.some(
+        (route, index) =>
+          route !== this.current!.routes[index] &&
+          this.viaRefinementRouteIndexes!.has(index),
+      )
+    )
+      return
+    this.geometryChecks++
+    if (
+      this.phase === "contacts" &&
+      this.guard.hasContactPair(routes, this.pairs[0]!)
+    )
+      return
+    const remainingPairs = this.candidateContactCheck!(routes)
+    if (this.phase === "contacts") {
+      if (
+        remainingPairs.length >= this.pairs.length ||
+        remainingPairs.some(
+          (pair) =>
+            (pair[0] === this.pairs[0]![0] && pair[1] === this.pairs[0]![1]) ||
+            !this.pairs.some(
+              (previous) => previous[0] === pair[0] && previous[1] === pair[1],
+            ),
+        )
+      )
+        return
+    } else if (remainingPairs.length > 0) return
+    this.candidateChecks++
+    const candidate = { routes, snapshot: this.snapshot(routes) }
+    if (hasNewTraceObstacleOverlaps(candidate.snapshot, this.inputSnapshot!))
+      return
+    if (!this.best || isBetter(candidate, this.best)) this.best = candidate
+    if (
+      this.phase === "vias" &&
+      candidate.snapshot.count < this.current!.snapshot.count &&
+      candidate.snapshot.count <= this.targetDrcCount
+    ) {
+      this.current = candidate
+      if (this.fineViaAdjustment) this.finish()
+      else this.startViaRound()
+      return
+    }
+    if (
+      this.phase === "contacts" &&
+      this.best.snapshot.count <= this.current!.snapshot.count &&
+      countVias(this.best.routes) <= countVias(this.current!.routes)
+    ) {
+      this.current = this.best
+      this.startContactRound()
+    }
+  }
+
+  override getOutput(): HighDensityRoute[] {
+    return this.outputHdRoutes
+  }
+}

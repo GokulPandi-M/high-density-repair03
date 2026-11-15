@@ -43,9 +43,14 @@ export type JumperType = "1206x4" | "0603"
 
 export interface SimpleRouteJson {
   layerCount: number
+  /** Enables partial via spans; autorouted vias span the board by default. */
+  allowBlindAndBuriedVias?: boolean
   minTraceWidth: number
   nominalTraceWidth?: number
   minViaDiameter?: number
+  minViaHoleDiameter?: number
+  min_via_hole_diameter?: number
+  allowViaInPad?: boolean
   minBoardEdgeClearance?: number
   minTraceToPadEdgeClearance?: number
   minViaEdgeToPadEdgeClearance?: number
@@ -69,6 +74,7 @@ export interface Obstacle {
   center: { x: number; y: number }
   width: number
   height: number
+  shape?: "circle"
   /** Optional counter-clockwise rotation metadata in degrees. */
   ccwRotationDegrees?: number
   connectedTo: Array<TraceId | NetId>
@@ -111,6 +117,9 @@ export interface SimplifiedPcbTrace {
         to_layer: string
         from_layer: string
         via_diameter?: number
+        via_hole_diameter?: number
+        /** Explicit copper layers; otherwise expand the inclusive from/to span. */
+        layers?: string[]
       }
     | {
         route_type: "jumper"

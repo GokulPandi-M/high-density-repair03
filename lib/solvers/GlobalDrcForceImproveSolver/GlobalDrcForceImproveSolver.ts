@@ -32,6 +32,7 @@ import {
   applyViaInPadLayerMoveForError,
   cloneRoutes,
   cloneRoutesForIndexes,
+  createBroadRepulsionCandidateRunner,
   getCenteredErrors,
   getDrcSnapshot,
   getTopologyRepairDrcSnapshot,
@@ -43,6 +44,8 @@ import {
   getTraceRouteIndexForError,
   getTraceRoutePairForError,
   getViaDrcIssueCount,
+  hasNewTraceObstacleOverlaps,
+  hasNewRouteObstacleOverlaps,
   isBetterDrcSnapshot,
   isDrcSnapshotCountBetter,
   isTraceObstacleDrcError,
@@ -54,6 +57,10 @@ import {
 import { applyTraceToPadClearanceRelaxation } from "./traceToPadClearanceRelaxation"
 import { applyViaToPadClearanceRelaxation } from "./viaToPadClearanceRelaxation"
 import { RELAXED_DRC_OPTIONS } from "./drcPresets"
+import { restoreOverlappingConnections } from "./restoreOverlappingConnections"
+import { TraceContactGuard } from "./TraceContactGuard"
+import { repairNewTraceContacts } from "./repairNewTraceContacts"
+import { haveSameForceCandidateGeometry } from "./haveSameForceCandidateGeometry"
 import type {
   DrcEvaluator,
   DrcSnapshot,
@@ -189,7 +196,10 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
   readonly enableSafeTraceLayerMoves: boolean
   readonly enableViaInPadLayerMoves: boolean
   readonly enableTraceViaOwnerTargeting: boolean
+  readonly deferTraceContactGuard: boolean
   outputHdRoutes: HighDensityRoute[]
+  /** Portfolio children defer this invariant until the final portfolio output. */
+  protected deferTraceObstacleOverlapGuard = false
   private initialDrcIssueCount: number | undefined
   private initialRepairDrcIssueCount: number | undefined
   private initialLowCountErrorsHaveMovableTraces = false
@@ -210,6 +220,14 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
   private drcCountPlateauChecks = 0
   private largeBoardBroadFallbackMisses = 0
   private outputSnapshot: DrcSnapshot | undefined
+  private overlapSafeCheckpoint:
+    | { routes: HighDensityRoute[]; snapshot: DrcSnapshot }
+    | undefined
+  private traceObstacleRepairRolledBack = false
+  private traceObstacleConnectionsRestored = 0
+  private traceContactGuard?: TraceContactGuard
+  private peerTraceRepairRolledBack = false
+  private overlapRestorationChecks = 0
   private legacyCleanCheckpoint:
     | { routes: HighDensityRoute[]; snapshot: DrcSnapshot }
     | undefined
@@ -265,6 +283,7 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
     this.enableViaInPadLayerMoves = params.enableViaInPadLayerMoves ?? false
     this.enableTraceViaOwnerTargeting =
       params.enableTraceViaOwnerTargeting ?? false
+    this.deferTraceContactGuard = params.deferTraceContactGuard ?? false
     this.outputHdRoutes = params.hdRoutes
     if (this.referenceDrcEvaluator) {
       this.referenceInputSnapshot = this.getReferenceDrcSnapshot(
@@ -295,6 +314,7 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
         enableSafeTraceLayerMoves: this.enableSafeTraceLayerMoves,
         enableViaInPadLayerMoves: this.enableViaInPadLayerMoves,
         enableTraceViaOwnerTargeting: this.enableTraceViaOwnerTargeting,
+        deferTraceContactGuard: this.deferTraceContactGuard,
       },
     ] as const
   }
@@ -320,6 +340,14 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
       globalDrcForceImproveLargeBoardBroadFallbackMisses:
         this.largeBoardBroadFallbackMisses,
       globalDrcForceImproveViaPadRepairRolledBack: this.viaPadRepairRolledBack,
+      globalDrcForceImproveTraceObstacleRepairRolledBack:
+        this.traceObstacleRepairRolledBack,
+      globalDrcForceImproveTraceObstacleConnectionsRestored:
+        this.traceObstacleConnectionsRestored,
+      globalDrcForceImprovePeerTraceRepairRolledBack:
+        this.peerTraceRepairRolledBack,
+      globalDrcForceImproveOverlapRestorationChecks:
+        this.overlapRestorationChecks,
       globalDrcForceImproveReferenceInputDrcIssueCount:
         this.referenceInputDrcIssueCount,
       globalDrcForceImproveReferenceCandidateDrcIssueCount:
@@ -402,10 +430,88 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
     return getRepairDrcIssueScore(snapshot)
   }
 
+  private getNewPeerContactConnectionNames(
+    routes: HighDensityRoute[],
+  ): Set<HighDensityRoute["connectionName"]> {
+    if (this.deferTraceContactGuard) return new Set()
+    this.traceContactGuard ??= new TraceContactGuard({
+      srj: this.srj,
+      inputRoutes: this.guardedInputHdRoutes,
+      connMap: this.connMap,
+    })
+    return this.traceContactGuard.getNewContactConnectionNames(routes)
+  }
+
+  private rememberOverlapSafeRoutes(
+    routes: HighDensityRoute[],
+    snapshot: DrcSnapshot,
+  ): void {
+    if (this.deferTraceObstacleOverlapGuard) return
+    const checkpoint = this.overlapSafeCheckpoint
+    if (
+      checkpoint &&
+      !isBetterDrcSnapshot(
+        snapshot,
+        this.getViaIssueCount(snapshot),
+        this.getRepairIssueCount(checkpoint.snapshot),
+        this.getRepairIssueScore(checkpoint.snapshot),
+        this.getViaIssueCount(checkpoint.snapshot),
+        checkpoint.snapshot,
+      )
+    ) {
+      return
+    }
+    if (
+      (this.inputSnapshot &&
+        hasNewTraceObstacleOverlaps(snapshot, this.inputSnapshot)) ||
+      this.getNewPeerContactConnectionNames(routes).size > 0
+    ) {
+      return
+    }
+    this.overlapSafeCheckpoint = {
+      routes: materializeRoutes(cloneRoutes(routes)),
+      snapshot,
+    }
+  }
+
+  private repairPeerContacts({
+    routes,
+    snapshot,
+    inputSnapshot,
+  }: {
+    routes: HighDensityRoute[]
+    snapshot: DrcSnapshot
+    inputSnapshot: DrcSnapshot
+  }): { routes: HighDensityRoute[]; snapshot: DrcSnapshot } | undefined {
+    if (this.getNewPeerContactConnectionNames(routes).size === 0)
+      return undefined
+    return repairNewTraceContacts({
+      srj: this.srj,
+      routes,
+      snapshot,
+      inputSnapshot,
+      guard: this.traceContactGuard!,
+      getSnapshot: (candidate) => this.getSnapshot(candidate),
+      hasNewObstacleOverlaps:
+        this.autoroutingDrcEngine && !this.drcEvaluator
+          ? (candidate) =>
+              hasNewRouteObstacleOverlaps({
+                srj: this.srj,
+                ...candidate,
+                inputSnapshot,
+                engine: this.autoroutingDrcEngine!,
+              })
+          : undefined,
+      connMap: this.connMap,
+      viaHoleDiameter: this.viaHoleDiameter,
+    })
+  }
+
   private acceptSolvedRoutes(
     routes: HighDensityRoute[],
     snapshot: DrcSnapshot,
   ) {
+    this.rememberOverlapSafeRoutes(routes, snapshot)
     const traceRelaxedRoutes = this.enablePostSolveClearanceRelaxation
       ? applyTraceToPadClearanceRelaxation(this.srj, routes, this.connMap)
       : routes
@@ -427,6 +533,81 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
     let acceptedSnapshot = relaxedSnapshotIsNoWorse ? relaxedSnapshot : snapshot
     const inputSnapshot =
       this.inputSnapshot ?? this.getSnapshot(this.guardedInputHdRoutes)
+    let peerConnectionNames = this.deferTraceObstacleOverlapGuard
+      ? new Set<HighDensityRoute["connectionName"]>()
+      : this.getNewPeerContactConnectionNames(acceptedRoutes)
+    if (peerConnectionNames.size > 0) {
+      const repaired = this.repairPeerContacts({
+        routes: acceptedRoutes,
+        snapshot: acceptedSnapshot,
+        inputSnapshot,
+      })
+      if (repaired) {
+        acceptedRoutes = repaired.routes
+        acceptedSnapshot = repaired.snapshot
+        peerConnectionNames = new Set()
+        this.rememberOverlapSafeRoutes(acceptedRoutes, acceptedSnapshot)
+      }
+    }
+    if (
+      !this.deferTraceObstacleOverlapGuard &&
+      (hasNewTraceObstacleOverlaps(acceptedSnapshot, inputSnapshot) ||
+        peerConnectionNames.size > 0)
+    ) {
+      this.peerTraceRepairRolledBack = peerConnectionNames.size > 0
+      const restoredNames = new Set<HighDensityRoute["connectionName"]>()
+      // Restoring one connection can expose a contact with another repaired
+      // connection. Bound full-board revalidation, then retain the safe checkpoint.
+      const restorationLimit = peerConnectionNames.size > 0 ? 2 : 1
+      for (let attempt = 0; attempt < restorationLimit; attempt++) {
+        const wireConnectionNames = new Set(
+          this.traceContactGuard?.getNewWireContactPairs(acceptedRoutes).flat(),
+        )
+        const restored = restoreOverlappingConnections({
+          routes: acceptedRoutes,
+          snapshot: acceptedSnapshot,
+          inputSnapshot,
+          checkpointRoutes:
+            this.overlapSafeCheckpoint?.routes ?? this.guardedInputHdRoutes,
+          peerConnectionNames:
+            wireConnectionNames.size > 0
+              ? wireConnectionNames
+              : peerConnectionNames,
+        })
+        if (!restored) break
+        for (const name of restored.restoredConnectionNames)
+          restoredNames.add(name)
+        let restoredSnapshot = this.getSnapshot(restored.routes)
+        const repaired = this.repairPeerContacts({
+          routes: restored.routes,
+          snapshot: restoredSnapshot,
+          inputSnapshot,
+        })
+        if (repaired) {
+          restored.routes = repaired.routes
+          restoredSnapshot = repaired.snapshot
+        }
+        this.overlapRestorationChecks++
+        this.rememberOverlapSafeRoutes(restored.routes, restoredSnapshot)
+        if (this.overlapSafeCheckpoint?.snapshot === restoredSnapshot) {
+          this.traceObstacleConnectionsRestored = restoredNames.size
+          break
+        }
+        acceptedRoutes = restored.routes
+        acceptedSnapshot = restoredSnapshot
+        peerConnectionNames =
+          this.getNewPeerContactConnectionNames(acceptedRoutes)
+        if (
+          !hasNewTraceObstacleOverlaps(acceptedSnapshot, inputSnapshot) &&
+          peerConnectionNames.size === 0
+        )
+          break
+      }
+      acceptedRoutes =
+        this.overlapSafeCheckpoint?.routes ?? this.guardedInputHdRoutes
+      acceptedSnapshot = this.overlapSafeCheckpoint?.snapshot ?? inputSnapshot
+      this.traceObstacleRepairRolledBack = true
+    }
     if (this.referenceDrcEvaluator) {
       const referenceInputSnapshot = this.referenceInputSnapshot!
       const referenceCandidateSnapshot =
@@ -437,6 +618,7 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
         acceptedRoutes = this.guardedInputHdRoutes
         acceptedSnapshot = inputSnapshot
         this.referenceCandidateRolledBack = true
+        this.traceObstacleConnectionsRestored = 0
       }
     }
     this.outputHdRoutes = acceptedRoutes
@@ -520,7 +702,11 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
     if (
       !this.legacyCleanCheckpoint &&
       nonViaPadIssueCount === 0 &&
-      bestSnapshot.errors.some(isViaPadDrcError)
+      bestSnapshot.errors.some(isViaPadDrcError) &&
+      (this.deferTraceObstacleOverlapGuard ||
+        (this.getNewPeerContactConnectionNames(bestRoutes).size === 0 &&
+          (!this.inputSnapshot ||
+            !hasNewTraceObstacleOverlaps(bestSnapshot, this.inputSnapshot))))
     ) {
       this.legacyCleanCheckpoint = {
         routes: materializeRoutes(cloneRoutes(bestRoutes)),
@@ -553,6 +739,9 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
         this.getRepairIssueCount(bestSnapshot),
       )
     }
+    // Exploration may temporarily introduce contacts that a later step clears.
+    // Preserve the best publishable result without restricting that search.
+    this.rememberOverlapSafeRoutes(bestRoutes, bestSnapshot)
 
     if (bestSnapshot.count === 0) {
       this.acceptSolvedRoutes(bestRoutes, bestSnapshot)
@@ -1324,6 +1513,7 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
 
       this.errorCursor = (errorIndex + 1) % prioritizedErrors.length
       const canMoveSharedViaSiteWithoutTradingDrcErrors = bestIssueCount === 1
+      let previousRejectedForceCandidate: HighDensityRoute[] | undefined
 
       for (const scale of getForceScalesForEffort(this.effort)) {
         if (candidateAttemptsThisStep >= maxCandidateAttemptsThisStep) break
@@ -1346,6 +1536,20 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
         const materializedCandidateRoutes = materializeRoutes(candidateRoutes)
         candidateAttemptsThisStep += 1
         this.candidateAttempts += 1
+        // Clamped moves and fixed detours can produce identical geometry at
+        // successive scales. Retain the logical budget without repeating DRC.
+        // Scope this to native checks and this error's unchanged incumbent;
+        // custom evaluators can have their own state and caching contracts.
+        if (
+          !this.drcEvaluator &&
+          previousRejectedForceCandidate &&
+          haveSameForceCandidateGeometry(
+            previousRejectedForceCandidate,
+            materializedCandidateRoutes,
+          )
+        ) {
+          continue
+        }
         const candidateSnapshot = this.getSnapshot(materializedCandidateRoutes)
         const candidateViaIssueCount = this.getViaIssueCount(candidateSnapshot)
 
@@ -1372,6 +1576,9 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
           }
           break
         }
+        if (!this.drcEvaluator) {
+          previousRejectedForceCandidate = materializedCandidateRoutes
+        }
       }
 
       if (acceptedCandidate) break
@@ -1397,19 +1604,28 @@ export class GlobalDrcForceImproveSolver extends BaseSolver {
     ) {
       attemptedPeriodicLargeBoardBroadFallback =
         shouldTryPeriodicLargeBoardBroadFallback
+      const runBroadCandidate = this.drcEvaluator
+        ? undefined
+        : createBroadRepulsionCandidateRunner({
+            srj: this.srj,
+            effort: this.effort,
+            connMap: this.connMap,
+          })
       for (const passMultiplier of [1, EXTENDED_BROAD_FORCE_PASS_MULTIPLIER]) {
-        const broadCandidateRoutes = applyBroadRepulsionForces(
-          this.srj,
-          bestRoutes,
-          this.effort,
-          passMultiplier,
-          this.connMap,
-          this.drcEvaluator === undefined,
-          // This is a speculative candidate and is DRC-evaluated immediately.
-          // Final cleanup here can perturb branch selection and trigger another
-          // expensive broad attempt; direct/final broad outputs still clean up.
-          false,
-        )
+        const broadCandidateRoutes = runBroadCandidate
+          ? runBroadCandidate(bestRoutes, passMultiplier)
+          : applyBroadRepulsionForces(
+              this.srj,
+              bestRoutes,
+              this.effort,
+              passMultiplier,
+              this.connMap,
+              this.drcEvaluator === undefined,
+              // This is a speculative candidate and is DRC-evaluated immediately.
+              // Final cleanup here can perturb branch selection and trigger another
+              // expensive broad attempt; direct/final broad outputs still clean up.
+              false,
+            )
         if (broadCandidateRoutes === bestRoutes) continue
         const broadCandidateSnapshot = this.getSnapshot(broadCandidateRoutes)
         const broadCandidateViaIssueCount = this.getViaIssueCount(
