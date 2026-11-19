@@ -7,6 +7,7 @@ import {
   getSvgFromGraphicsObject,
   stackGraphicsHorizontally,
 } from "graphics-debug"
+import { VisualizedGlobalDrcForceImproveSolver } from "../fixture-support/VisualizedGlobalDrcForceImproveSolver"
 import { GlobalDrcBranchPortfolioSolver, type HighDensityRoute } from "../lib"
 import {
   getDrcSnapshot,
@@ -29,6 +30,7 @@ const input: CapturedInput = JSON.parse(
     ),
   ).toString(),
 )
+let outputDrcCount: number
 let output: HighDensityRoute[]
 let outputPadOverlaps: ReturnType<typeof getPhysicalSmtPadOverlaps>
 
@@ -74,6 +76,7 @@ beforeAll(() => {
     connMap,
     solver.autoroutingDrcEngine,
   )
+  outputDrcCount = after.count
   expect(
     before.errors.some((error) =>
       String(error.message).includes(provenance.physicalPad.obstacleId),
@@ -108,4 +111,24 @@ test("snapshots actual pad copper before and after repair", async () => {
       svgHeight: 500,
     }),
   ).toMatchSvgSnapshot(import.meta.path)
+})
+
+test("snapshots captured board routing after repair", async () => {
+  const board = new VisualizedGlobalDrcForceImproveSolver({
+    srj: input.srj,
+    hdRoutes: output,
+    connMap: new ConnectivityMap(input.netMap),
+  }).visualize()
+  const graphics = stackGraphicsHorizontally([board], {
+    titles: [
+      `Fire-stick captured routing | DRC findings: ${outputDrcCount} | Target pad overlaps: ${outputPadOverlaps.length}`,
+    ],
+  })
+  await expect(
+    getSvgFromGraphicsObject(graphics, {
+      backgroundColor: "white",
+      svgWidth: 1200,
+      svgHeight: 1200,
+    }),
+  ).toMatchSvgSnapshot(import.meta.path, "board")
 })
