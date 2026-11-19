@@ -7,11 +7,7 @@ import {
   getSvgFromGraphicsObject,
   stackGraphicsHorizontally,
 } from "graphics-debug"
-import {
-  getRouteLines,
-  getViaCircles,
-  VisualizedGlobalDrcForceImproveSolver,
-} from "../fixture-support/VisualizedGlobalDrcForceImproveSolver"
+import { VisualizedGlobalDrcForceImproveSolver } from "../fixture-support/VisualizedGlobalDrcForceImproveSolver"
 import { GlobalDrcBranchPortfolioSolver, type HighDensityRoute } from "../lib"
 import {
   getDrcSnapshot,
@@ -19,6 +15,7 @@ import {
 } from "../lib/solvers/GlobalDrcForceImproveSolver/solverHelpers"
 import { getPhysicalSmtPadOverlaps } from "./fixtures/getPhysicalSmtPadOverlaps"
 import { getExistingPadOverlapGraphics } from "./fixtures/getExistingPadOverlapGraphics"
+import { getSavedCopperGraphics } from "./fixtures/getSavedCopperGraphics"
 import provenance from "./fixtures/existing-pad-overlap-input.provenance.json"
 
 type CapturedInput = Omit<
@@ -142,11 +139,9 @@ test("snapshots captured board routing after repair", async () => {
         id.startsWith("pcb_smtpad_fixed_"),
       ),
   )
-  board.lines = [...getRouteLines(displayCopper, null), ...(board.lines ?? [])]
-  board.circles = [
-    ...getViaCircles(displayCopper, null),
-    ...(board.circles ?? []),
-  ]
+  const copper = getSavedCopperGraphics(displayCopper)
+  board.lines = [...(copper.lines ?? []), ...(board.lines ?? [])]
+  board.circles = [...(copper.circles ?? []), ...(board.circles ?? [])]
   const graphics = stackGraphicsHorizontally([board], {
     titles: [
       `Fire-stick captured routing | DRC findings: ${outputDrcCount} | Target pad overlaps: ${outputPadOverlaps.length}`,
