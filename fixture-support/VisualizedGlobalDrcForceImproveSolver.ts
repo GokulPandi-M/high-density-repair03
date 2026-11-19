@@ -82,7 +82,7 @@ const connectionPointHasCoordinates = (
   typeof (point as { y?: unknown }).y === "number" &&
   Number.isFinite((point as { y: number }).y)
 
-const getRouteLines = (
+export const getRouteLines = (
   routes: HighDensityRoute[],
   visibleZ: number | null,
 ): Line[] =>
@@ -108,7 +108,7 @@ const getRouteLines = (
     return lines
   })
 
-const getViaCircles = (
+export const getViaCircles = (
   routes: HighDensityRoute[],
   visibleZ: number | null,
 ): Circle[] =>

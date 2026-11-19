@@ -7,7 +7,11 @@ import {
   getSvgFromGraphicsObject,
   stackGraphicsHorizontally,
 } from "graphics-debug"
-import { VisualizedGlobalDrcForceImproveSolver } from "../fixture-support/VisualizedGlobalDrcForceImproveSolver"
+import {
+  getRouteLines,
+  getViaCircles,
+  VisualizedGlobalDrcForceImproveSolver,
+} from "../fixture-support/VisualizedGlobalDrcForceImproveSolver"
 import { GlobalDrcBranchPortfolioSolver, type HighDensityRoute } from "../lib"
 import {
   getDrcSnapshot,
@@ -119,6 +123,30 @@ test("snapshots captured board routing after repair", async () => {
     hdRoutes: output,
     connMap: new ConnectivityMap(input.netMap),
   }).visualize()
+  // Replace display-only fixed-copper rectangles with verified saved geometry.
+  // Keep the original SRJ, repair output, and DRC calculation unchanged.
+  const displayCopper: HighDensityRoute[] = JSON.parse(
+    gunzipSync(
+      readFileSync(
+        new URL(
+          "./fixtures/existing-pad-overlap-display-copper.json.gz",
+          import.meta.url,
+        ),
+      ),
+    ).toString(),
+  )
+  board.rects = board.rects?.filter(
+    (_, index) =>
+      index === 0 ||
+      !input.srj.obstacles[index - 1]?.connectedTo.some((id) =>
+        id.startsWith("pcb_smtpad_fixed_"),
+      ),
+  )
+  board.lines = [...getRouteLines(displayCopper, null), ...(board.lines ?? [])]
+  board.circles = [
+    ...getViaCircles(displayCopper, null),
+    ...(board.circles ?? []),
+  ]
   const graphics = stackGraphicsHorizontally([board], {
     titles: [
       `Fire-stick captured routing | DRC findings: ${outputDrcCount} | Target pad overlaps: ${outputPadOverlaps.length}`,
@@ -128,7 +156,7 @@ test("snapshots captured board routing after repair", async () => {
     getSvgFromGraphicsObject(graphics, {
       backgroundColor: "white",
       svgWidth: 1200,
-      svgHeight: 1200,
+      svgHeight: 650,
     }),
   ).toMatchSvgSnapshot(import.meta.path, "board")
 })
